@@ -74,6 +74,7 @@ class Sp_handler
                                const Database_qualified_name *name,
                                TABLE *table) const;
 public:
+  virtual ~Sp_handler() {}
   static const Sp_handler *handler(enum enum_sql_command cmd);
   static const Sp_handler *handler(stored_procedure_type type);
   static const Sp_handler *handler(MDL_key::enum_mdl_namespace ns);
