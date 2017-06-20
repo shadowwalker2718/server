@@ -1078,6 +1078,7 @@ struct latch_t {
 struct sync_check_functor_t {
 	virtual ~sync_check_functor_t() { }
 	virtual bool operator()(const latch_level_t) const = 0;
+        virtual ~sync_check_functor_t() {}
 };
 
 /** Check that no latch is being held.
