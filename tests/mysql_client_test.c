@@ -33,6 +33,9 @@
 */
 
 #include "mysql_client_fw.c"
+#ifndef _WIN32
+#include <arpa/inet.h>
+#endif
 
 static const my_bool my_true= 1;
 
@@ -19667,12 +19670,15 @@ static void test_proxy_header_tcp(const char *ipaddr, int port)
   int rc;
   MYSQL_RES *result;
   int family = (strchr(ipaddr,':') == NULL)?AF_INET:AF_INET6;
-
   char query[256];
   char text_header[256];
   char addr_bin[16];
-  v2_proxy_header v2_header = { 0 };
+  v2_proxy_header v2_header;
+  void *header_data[2];
+  size_t header_lengths[2];
+  int i;
 
+  memset(&v2_header, 0, sizeof(v2_header));
   sprintf(text_header,"PROXY %s %s %s %d 3306\r\n",family == AF_INET?"TCP4":"TCP6", ipaddr, ipaddr, port);
  
   inet_pton(family,ipaddr,addr_bin);
@@ -19699,33 +19705,34 @@ static void test_proxy_header_tcp(const char *ipaddr, int port)
   }
 
   sprintf(query,"CREATE USER 'u'@'%s' IDENTIFIED BY 'password'",ipaddr);
-  rc = mysql_query(mysql, query);
+  rc= mysql_query(mysql, query);
   myquery(rc);
 
-  void *header_data[]= {text_header, &v2_header};
-  size_t header_lengths[]= {strlen(text_header),family == AF_INET ? 28 : 52};
-  for (int i = 0; i < 2; i++)
+  header_data[0]= text_header;
+  header_data[1]= &v2_header;
+
+  header_lengths[0]= strlen(text_header);
+  header_lengths[1]= family == AF_INET ? 28 : 52;
+
+  for (i = 0; i < 2; i++)
   {
     MYSQL *m;
-    if (!(m = mysql_client_init(NULL)))
-    {
-      fprintf(stdout, "\n mysql_client_init() failed");
-      exit(1);
-    }
+    size_t addrlen;
+    MYSQL_ROW row;
+    m = mysql_client_init(NULL);
+    DIE_UNLESS(m);
     mysql_optionsv(m, MARIADB_OPT_PROXY_HEADER, header_data[i], header_lengths[i]);
     if (!mysql_real_connect(m, opt_host, "u", "password", NULL, opt_port, opt_unix_socket, 0))
     {
-      fprintf(stdout, "\n mysql_client_init() failed");
-      exit(1);
+       DIE_UNLESS(0);
     }
     rc= mysql_query(m, "select host from information_schema.processlist WHERE ID = connection_id()");
     myquery(rc);
     /* get the result */
     result= mysql_store_result(m);
     mytest(result);
-    MYSQL_ROW row;
     row = mysql_fetch_row(result);
-    size_t addrlen = strlen(ipaddr);
+    addrlen = strlen(ipaddr);
     DIE_UNLESS(strncmp(row[0], ipaddr, addrlen) == 0);
     DIE_UNLESS(atoi(row[0] + addrlen+1) == port);
     mysql_close(m);
@@ -19739,28 +19746,31 @@ static void test_proxy_header_tcp(const char *ipaddr, int port)
 /* Test proxy protocol with AF_UNIX (localhost) */
 static void test_proxy_header_localhost()
 {
-  v2_proxy_header v2_header = { 0 };
+  v2_proxy_header v2_header;
+  void *header_data = &v2_header;
+  size_t header_length= 216 + 16;
+  MYSQL *m;
+  MYSQL_RES *result;
+  MYSQL_ROW row;
+  int rc;
 
+  memset(&v2_header, 0, sizeof(v2_header));
   memcpy(v2_header.sig, "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A", 12);
   v2_header.ver_cmd = (0x2 << 4) | 0x1; /* Version (0x2) , Command = PROXY (0x1) */
   v2_header.fam= 0x31;
   v2_header.len= htons(216);
   strcpy(v2_header.addr.unx.src_addr,"/tmp/mysql.sock");
   strcpy(v2_header.addr.unx.dst_addr,"/tmp/mysql.sock");
-  void *header_data = &v2_header;
-  size_t header_length= 216 + 16;
-
-  int rc = mysql_query(mysql, "CREATE USER 'u'@'localhost' IDENTIFIED BY 'password'");
+  rc = mysql_query(mysql, "CREATE USER 'u'@'localhost' IDENTIFIED BY 'password'");
   myquery(rc);
-  MYSQL *m = mysql_client_init(NULL);
+  m = mysql_client_init(NULL);
   DIE_UNLESS(m != NULL);
   mysql_optionsv(m, MARIADB_OPT_PROXY_HEADER, header_data, header_length);
   DIE_UNLESS(mysql_real_connect(m, opt_host, "u", "password", NULL, opt_port, opt_unix_socket, 0) == m);
   DIE_UNLESS(mysql_query(m, "select host from information_schema.processlist WHERE ID = connection_id()") == 0);
   /* get the result */
-  MYSQL_RES *result= mysql_store_result(m);
+  result= mysql_store_result(m);
   mytest(result);
-  MYSQL_ROW row;
   row = mysql_fetch_row(result);
   DIE_UNLESS(strcmp(row[0], "localhost") == 0);
   mysql_close(m);
@@ -19772,12 +19782,12 @@ static void test_proxy_header_localhost()
 static void test_proxy_header_ignore()
 {
   MYSQL *m = mysql_client_init(NULL);
+  v2_proxy_header v2_header;
   DIE_UNLESS(m != NULL);
   mysql_optionsv(m, MARIADB_OPT_PROXY_HEADER, "PROXY UNKNOWN\r\n",15);
   DIE_UNLESS(mysql_real_connect(m, opt_host, "root", "", NULL, opt_port, opt_unix_socket, 0) == m);
   mysql_close(m);
 
-  v2_proxy_header v2_header = { 0 };
   memcpy(v2_header.sig, "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A", 12);
   v2_header.ver_cmd = (0x2 << 4) | 0x0; /* Version (0x2) , Command = LOCAL (0x0) */
   v2_header.fam= 0x0; /* AF_UNSPEC*/
@@ -19786,7 +19796,6 @@ static void test_proxy_header_ignore()
   mysql_optionsv(m, MARIADB_OPT_PROXY_HEADER, &v2_header,16);
   DIE_UNLESS(mysql_real_connect(m, opt_host, "root", "", NULL, opt_port, opt_unix_socket, 0) == m);
   mysql_close(m);
-
 }
 
 

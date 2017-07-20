@@ -342,8 +342,25 @@ bool is_proxy_protocol_allowed(const sockaddr *addr, int len)
 {
   sockaddr_storage addr_storage;
   struct sockaddr *normalized_addr= (struct sockaddr *)&addr_storage;
-  int dst_len;
-  vio_get_normalized_ip(addr, len,normalized_addr, &dst_len);
+
+  /*
+   Non-TCP addresses (unix domain socket, windows pipe and shared memory
+   gets tranlated to TCP4 localhost address.
+
+   Note, that vio remote addresses are initialized with binary zeros
+   for these protocols (which is AF_UNSPEC everywhere).
+  */
+  if(addr->sa_family == AF_UNSPEC || addr->sa_family == AF_UNIX)
+  {
+    sockaddr_in *sin= (sockaddr_in *) normalized_addr;
+    sin->sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    sin->sin_family= AF_INET;
+  }
+  else
+  {
+    int dst_len;
+    vio_get_normalized_ip(addr, len,normalized_addr, &dst_len);
+  }
 
   for (size_t i= 0; i < proxy_protocol_subnet_count; i++)
     if (addr_matches_subnet(normalized_addr, &proxy_protocol_subnets[i]))
