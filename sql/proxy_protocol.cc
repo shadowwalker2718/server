@@ -126,7 +126,7 @@ static int parse_proxy_protocol_v2_header(uchar *hdr, size_t len,proxy_peer_info
   {
   case 0x11:  /* TCPv4 */
     sin->sin_family= AF_INET;
-    memcpy(&(sin->sin_addr.s_addr), hdr + 16, 4);
+    memcpy(&(sin->sin_addr), hdr + 16, 4);
     peer_info->port= (hdr[24] << 8) + hdr[25];
     break;
   case 0x21:  /* TCPv6 */
@@ -186,7 +186,7 @@ int parse_proxy_protocol_header(NET *net, proxy_peer_info *peer_info)
     if (len < 0)
       return -1;
     // 2 last bytes are the length in network byte order of the part following header
-    ushort trail_len= (hdr[14] >> 8) + hdr[15];
+    ushort trail_len= ((ushort)hdr[14] >> 8) + hdr[15];
     if (trail_len > sizeof(hdr) - 16)
       return -1;
     len= vio_read(vio,  hdr + 16, trail_len);
@@ -353,7 +353,9 @@ bool is_proxy_protocol_allowed(const sockaddr *addr, int len)
   if(addr->sa_family == AF_UNSPEC || addr->sa_family == AF_UNIX)
   {
     sockaddr_in *sin= (sockaddr_in *) normalized_addr;
-    sin->sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    memset(sin, 0, sizeof (*sin));
+    static const char loopback_addr[]= {127,0,0,1};
+    memcpy(&sin->sin_addr,loopback_addr,4);
     sin->sin_family= AF_INET;
   }
   else
