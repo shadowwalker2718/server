@@ -608,7 +608,7 @@ void init_update_queries(void)
   sql_command_flags[SQLCOM_DELETE_MULTI]=   CF_CHANGES_DATA | CF_REEXECUTION_FRAGILE |
                                             CF_CAN_GENERATE_ROW_EVENTS |
                                             CF_OPTIMIZER_TRACE |
-                                            CF_CAN_BE_EXPLAINED;;
+                                            CF_CAN_BE_EXPLAINED;
   sql_command_flags[SQLCOM_REPLACE]=        CF_CHANGES_DATA | CF_REEXECUTION_FRAGILE |
                                             CF_CAN_GENERATE_ROW_EVENTS |
                                             CF_OPTIMIZER_TRACE |
@@ -4162,7 +4162,7 @@ mysql_execute_command(THD *thd)
             (!thd->is_current_stmt_binlog_format_row() ||
              !create_info.tmp_table()))
         {
-	  WSREP_TO_ISOLATION_BEGIN(create_table->db, create_table->table_name, NULL)
+	  WSREP_TO_ISOLATION_BEGIN(create_table->db, create_table->table_name, NULL);
         }
         /* Regular CREATE TABLE */
         res= mysql_create_table(thd, create_table, &create_info, &alter_info);
@@ -4207,7 +4207,7 @@ end_with_restore_list:
     DBUG_ASSERT(first_table == all_tables && first_table != 0);
     if (check_one_table_access(thd, INDEX_ACL, all_tables))
       goto error; /* purecov: inspected */
-    WSREP_TO_ISOLATION_BEGIN(first_table->db, first_table->table_name, NULL)
+    WSREP_TO_ISOLATION_BEGIN(first_table->db, first_table->table_name, NULL);
     /*
       Currently CREATE INDEX or DROP INDEX cause a full table rebuild
       and thus classify as slow administrative statements just like
@@ -4332,7 +4332,7 @@ end_with_restore_list:
     if (check_rename_table(thd, first_table, all_tables))
       goto error;
 
-    WSREP_TO_ISOLATION_BEGIN(0, 0, first_table)
+    WSREP_TO_ISOLATION_BEGIN(0, 0, first_table);
 
     if (mysql_rename_tables(thd, first_table, 0))
       goto error;
@@ -5114,7 +5114,7 @@ end_with_restore_list:
                           (CREATE_ACL | DROP_ACL) : CREATE_ACL,
                           &lex->name))
       break;
-    WSREP_TO_ISOLATION_BEGIN(lex->name.str, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(lex->name.str, NULL, NULL);
     res= mysql_create_db(thd, lex->name.str,
                          lex->create_info, &lex->create_info);
     break;
@@ -5123,7 +5123,7 @@ end_with_restore_list:
   {
     if (prepare_db_action(thd, DROP_ACL, &lex->name))
       break;
-    WSREP_TO_ISOLATION_BEGIN(lex->name.str, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(lex->name.str, NULL, NULL);
     res= mysql_rm_db(thd, lex->name.str, lex->if_exists());
     break;
   }
@@ -5155,7 +5155,7 @@ end_with_restore_list:
       res= 1;
       break;
     }
-    WSREP_TO_ISOLATION_BEGIN(db->str, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(db->str, NULL, NULL);
     res= mysql_upgrade_db(thd, db);
     if (!res)
       my_ok(thd);
@@ -5166,7 +5166,7 @@ end_with_restore_list:
     LEX_CSTRING *db= &lex->name;
     if (prepare_db_action(thd, ALTER_ACL, db))
       break;
-    WSREP_TO_ISOLATION_BEGIN(db->str, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(db->str, NULL, NULL);
     res= mysql_alter_db(thd, db->str, &lex->create_info);
     break;
   }
@@ -5209,7 +5209,7 @@ end_with_restore_list:
     if (res)
       break;
 
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     switch (lex->sql_command) {
     case SQLCOM_CREATE_EVENT:
     {
@@ -5245,7 +5245,7 @@ end_with_restore_list:
                                    &lex->spname->m_name);
     break;
   case SQLCOM_DROP_EVENT:
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     if (!(res= Events::drop_event(thd,
                                   &lex->spname->m_db, &lex->spname->m_name,
                                   lex->if_exists())))
@@ -5262,7 +5262,7 @@ end_with_restore_list:
                      "mysql", NULL, NULL, 1, 0))
       break;
 #ifdef HAVE_DLOPEN
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     if (!(res = mysql_create_function(thd, &lex->udf)))
       my_ok(thd);
 #else
@@ -5280,7 +5280,7 @@ end_with_restore_list:
                      "mysql", NULL, NULL, 1, 1) &&
         check_global_access(thd,CREATE_USER_ACL))
       break;
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     /* Conditionally writes to binlog */
     if (!(res= mysql_create_user(thd, lex->users_list,
                                  lex->sql_command == SQLCOM_CREATE_ROLE)))
@@ -5294,7 +5294,7 @@ end_with_restore_list:
         check_global_access(thd,CREATE_USER_ACL))
       break;
     /* Conditionally writes to binlog */
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     if (!(res= mysql_drop_user(thd, lex->users_list,
                                lex->sql_command == SQLCOM_DROP_ROLE)))
       my_ok(thd);
@@ -5307,7 +5307,7 @@ end_with_restore_list:
         check_global_access(thd,CREATE_USER_ACL))
       break;
     /* Conditionally writes to binlog */
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     if (lex->sql_command == SQLCOM_ALTER_USER)
       res= mysql_alter_user(thd, lex->users_list);
     else
@@ -5323,7 +5323,7 @@ end_with_restore_list:
       break;
 
     /* Conditionally writes to binlog */
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     if (!(res = mysql_revoke_all(thd, lex->users_list)))
       my_ok(thd);
     break;
@@ -5384,7 +5384,7 @@ end_with_restore_list:
         if (check_grant_routine(thd, grants | GRANT_ACL, all_tables, sph, 0))
 	  goto error;
         /* Conditionally writes to binlog */
-        WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+        WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
         res= mysql_routine_grant(thd, all_tables, sph,
                                  lex->users_list, grants,
                                  lex->sql_command == SQLCOM_REVOKE, TRUE);
@@ -5397,7 +5397,7 @@ end_with_restore_list:
                         all_tables, FALSE, UINT_MAX, FALSE))
 	  goto error;
         /* Conditionally writes to binlog */
-        WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+        WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
         res= mysql_table_grant(thd, all_tables, lex->users_list,
 			       lex->columns, lex->grant,
 			       lex->sql_command == SQLCOM_REVOKE);
@@ -5413,7 +5413,7 @@ end_with_restore_list:
       }
       else
       {
-          WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+        WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
         /* Conditionally writes to binlog */
         res= mysql_grant(thd, select_lex->db, lex->users_list, lex->grant,
                          lex->sql_command == SQLCOM_REVOKE,
@@ -5439,7 +5439,7 @@ end_with_restore_list:
   case SQLCOM_REVOKE_ROLE:
   case SQLCOM_GRANT_ROLE:
   {
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     if (!(res= mysql_grant_role(thd, lex->users_list,
                                 lex->sql_command != SQLCOM_GRANT_ROLE)))
       my_ok(thd);
@@ -5497,7 +5497,7 @@ end_with_restore_list:
     REFRESH_STATUS                          |
     REFRESH_USER_RESOURCES))
     {
-      WSREP_TO_ISOLATION_BEGIN_WRTCHK(WSREP_MYSQL_DB, NULL, NULL)
+      WSREP_TO_ISOLATION_BEGIN_WRTCHK(WSREP_MYSQL_DB, NULL, NULL);
     }
 #endif /* WITH_WSREP*/
 
@@ -5531,11 +5531,11 @@ end_with_restore_list:
         */
         if (first_table)
         {
-            WSREP_TO_ISOLATION_BEGIN_WRTCHK(NULL, NULL, first_table);
+          WSREP_TO_ISOLATION_BEGIN_WRTCHK(NULL, NULL, first_table);
         }
         else
         {
-            WSREP_TO_ISOLATION_BEGIN_WRTCHK(WSREP_MYSQL_DB, NULL, NULL);
+          WSREP_TO_ISOLATION_BEGIN_WRTCHK(WSREP_MYSQL_DB, NULL, NULL);
         }
       }
 #endif /* WITH_WSREP */
@@ -5933,7 +5933,7 @@ end_with_restore_list:
       if (check_routine_access(thd, ALTER_PROC_ACL, db, name,
                                Sp_handler::handler(lex->sql_command), 0))
         goto error;
-      WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+      WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
 
       /* Conditionally writes to binlog */
       sp_result= sph->sp_drop_routine(thd, lex->spname);
@@ -6052,7 +6052,7 @@ end_with_restore_list:
         Note: SQLCOM_CREATE_VIEW also handles 'ALTER VIEW' commands
         as specified through the thd->lex->create_view->mode flag.
       */
-      WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+      WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
       res= mysql_create_view(thd, first_table, thd->lex->create_view->mode);
       break;
     }
@@ -6061,14 +6061,14 @@ end_with_restore_list:
       if (check_table_access(thd, DROP_ACL, all_tables, FALSE, UINT_MAX, FALSE))
         goto error;
       /* Conditionally writes to binlog. */
-      WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+      WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
       res= mysql_drop_view(thd, first_table, thd->lex->drop_mode);
       break;
     }
   case SQLCOM_CREATE_TRIGGER:
   {
     /* Conditionally writes to binlog. */
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     res= mysql_create_or_drop_trigger(thd, all_tables, 1);
 
     break;
@@ -6076,7 +6076,7 @@ end_with_restore_list:
   case SQLCOM_DROP_TRIGGER:
   {
     /* Conditionally writes to binlog. */
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     res= mysql_create_or_drop_trigger(thd, all_tables, 0);
     break;
   }
@@ -6141,13 +6141,13 @@ end_with_restore_list:
       my_ok(thd);
     break;
   case SQLCOM_INSTALL_PLUGIN:
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     if (! (res= mysql_install_plugin(thd, &thd->lex->comment,
                                      &thd->lex->ident)))
       my_ok(thd);
     break;
   case SQLCOM_UNINSTALL_PLUGIN:
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
     if (! (res= mysql_uninstall_plugin(thd, &thd->lex->comment,
                                        &thd->lex->ident)))
       my_ok(thd);
@@ -6168,7 +6168,7 @@ end_with_restore_list:
     if (check_global_access(thd, SUPER_ACL))
       break;
 
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
 
     res= create_server(thd, &lex->server_options);
     break;
@@ -6181,7 +6181,7 @@ end_with_restore_list:
     if (check_global_access(thd, SUPER_ACL))
       break;
 
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
 
     if ((error= alter_server(thd, &lex->server_options)))
     {
@@ -6201,7 +6201,7 @@ end_with_restore_list:
     if (check_global_access(thd, SUPER_ACL))
       break;
 
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL)
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
 
     if ((err_code= drop_server(thd, &lex->server_options)))
     {
