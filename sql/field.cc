@@ -7688,32 +7688,32 @@ uint Field_varstring::max_packed_col_length(uint max_length)
 uint Field_varstring::get_key_image(uchar *buff, uint length,
                                     imagetype type_arg)
 {
-  uint f_length=  length_bytes == 1 ? (uint) *ptr : uint2korr(ptr);
-  uint local_char_length= length / field_charset->mbmaxlen;
-  uchar *pos= ptr+length_bytes;
-  local_char_length= my_charpos(field_charset, pos, pos + f_length,
-                                local_char_length);
-  set_if_smaller(f_length, local_char_length);
+  String val;
+  uint local_char_length;
+
+  val_str(&val, &val);
+  local_char_length= val.charpos(length / field_charset->mbmaxlen);
+  if (local_char_length < val.length())
+    val.length(local_char_length);
   /* Key is always stored with 2 bytes */
-  int2store(buff,f_length);
-  memcpy(buff+HA_KEY_BLOB_LENGTH, pos, f_length);
-  if (f_length < length)
+  int2store(buff, val.length());
+  memcpy(buff + HA_KEY_BLOB_LENGTH, val.ptr(), val.length());
+  if (val.length() < length)
   {
     /*
       Must clear this as we do a memcmp in opt_range.cc to detect
       identical keys
     */
-    bzero(buff+HA_KEY_BLOB_LENGTH+f_length, (length-f_length));
+    memset(buff + HA_KEY_BLOB_LENGTH + val.length(), 0, length - val.length());
   }
-  return HA_KEY_BLOB_LENGTH+f_length;
+  return HA_KEY_BLOB_LENGTH + val.length();
 }
 
 
 void Field_varstring::set_key_image(const uchar *buff,uint length)
 {
   length= uint2korr(buff);			// Real length is here
-  (void) Field_varstring::store((const char*) buff+HA_KEY_BLOB_LENGTH, length,
-                                field_charset);
+  (void) store((const char*) buff + HA_KEY_BLOB_LENGTH, length, field_charset);
 }
 
 

@@ -3209,14 +3209,9 @@ private:
     compression methods or compression levels.
   */
 
-  uint get_key_image(uchar *buff, uint length, imagetype type_arg)
-  { DBUG_ASSERT(0); return 0; }
-  void set_key_image(const uchar *buff, uint length)
-  { DBUG_ASSERT(0); }
-  int key_cmp(const uchar *a, const uchar *b)
-  { DBUG_ASSERT(0); return 0; }
   int key_cmp(const uchar *str, uint length)
   { DBUG_ASSERT(0); return 0; }
+  using Field_varstring::key_cmp;
   Field *new_key_field(MEM_ROOT *root, TABLE *new_table,
                        uchar *new_ptr, uint32 length,
                        uchar *new_null_ptr, uint new_null_bit)
