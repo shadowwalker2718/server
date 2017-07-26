@@ -24,7 +24,13 @@
 #include <proxy_protocol.h>
 #include <log.h>
 
-static int parse_proxy_protocol_v1_header(uchar *hdr, size_t len, proxy_peer_info *peer_info)
+#define PROXY_PROTOCOL_V1_SIGNATURE "PROXY"
+#define PROXY_PROTOCOL_V2_SIGNATURE "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"
+
+/*
+  Parse proxy protocol version 1 header (text)
+*/
+static int parse_v1_header(uchar *hdr, size_t len, proxy_peer_info *peer_info)
 {
   char *ctx= NULL;
   char *token;
@@ -34,7 +40,7 @@ static int parse_proxy_protocol_v1_header(uchar *hdr, size_t len, proxy_peer_inf
   token= strtok_r((char *)hdr, " ", &ctx);
   if (!token)
     return -1;
-  if (strcmp(token, "PROXY"))
+  if (strcmp(token, PROXY_PROTOCOL_V1_SIGNATURE))
     return -1;
 
   // Parse address Family : TCP4, TCP6 or UNKNOWN
@@ -91,10 +97,14 @@ static int parse_proxy_protocol_v1_header(uchar *hdr, size_t len, proxy_peer_inf
   return 0;
 }
 
-static int parse_proxy_protocol_v2_header(uchar *hdr, size_t len,proxy_peer_info *peer_info)
+
+/*
+  Parse proxy protocol V2 (binary) header
+*/
+static int parse_v2_header(uchar *hdr, size_t len,proxy_peer_info *peer_info)
 {
   /* V2 Signature */
-  if (memcmp(hdr, "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A", 12))
+  if (memcmp(hdr, PROXY_PROTOCOL_V2_SIGNATURE, 12))
     return -1;
 
   /* version  + command */
@@ -124,74 +134,89 @@ static int parse_proxy_protocol_v2_header(uchar *hdr, size_t len,proxy_peer_info
   struct sockaddr_in6 *sin6= (struct sockaddr_in6 *)(&peer_info->peer_addr);
   switch (fam)
   {
-  case 0x11:  /* TCPv4 */
-    sin->sin_family= AF_INET;
-    memcpy(&(sin->sin_addr), hdr + 16, 4);
-    peer_info->port= (hdr[24] << 8) + hdr[25];
-    break;
-  case 0x21:  /* TCPv6 */
-    sin6->sin6_family= AF_INET6;
-    memcpy(&(sin6->sin6_addr), hdr + 16, 16);
-    peer_info->port= (hdr[48] << 8) + hdr[49];
-    break;
-  case 0x31: /* AF_UNIX, strea,*/
-    peer_info->peer_addr.ss_family= AF_UNIX;
-    break;
-  default:
-    return -1;
+    case 0x11:  /* TCPv4 */
+      sin->sin_family= AF_INET;
+      memcpy(&(sin->sin_addr), hdr + 16, 4);
+      peer_info->port= (hdr[24] << 8) + hdr[25];
+      break;
+    case 0x21:  /* TCPv6 */
+      sin6->sin6_family= AF_INET6;
+      memcpy(&(sin6->sin6_addr), hdr + 16, 16);
+      peer_info->port= (hdr[48] << 8) + hdr[49];
+      break;
+    case 0x31: /* AF_UNIX, strea,*/
+      peer_info->peer_addr.ss_family= AF_UNIX;
+      break;
+    default:
+      return -1;
   }
   return 0;
 }
 
 
+/**
+  Try to parse proxy header.
+  https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
+
+  Whenever this function is called, client is connecting, and
+  we have have pre-read 4 bytes (NET_HEADER_SIZE)  from the network already. 
+  These 4 bytes did not match MySQL packet header, and (unless the client 
+  is buggy), those bytes must be proxy header.
+
+   @param[in]  net - vio and already preread bytes from the header
+   @param[out] peer_info - parsed proxy header with client host and port
+   @return 0 in case of success, -1 if error.
+*/
 int parse_proxy_protocol_header(NET *net, proxy_peer_info *peer_info)
 {
   uchar hdr[256];
-  size_t hdr_len= 0;
+  size_t pos= 0;
 
   DBUG_ASSERT(!net->compress);
   const uchar *preread_bytes= net->buff + net->where_b;
-  bool is_v1_header= !memcmp(preread_bytes, "PROX", 4);
-  bool is_v2_header= !is_v1_header && !memcmp(preread_bytes, "\x0D\x0A\x0D\x0A", 4);
-  if (!is_v1_header && !is_v2_header)
+  bool have_v1_header= !memcmp(preread_bytes, PROXY_PROTOCOL_V1_SIGNATURE, NET_HEADER_SIZE);
+  bool have_v2_header= !have_v1_header && !memcmp(preread_bytes, PROXY_PROTOCOL_V2_SIGNATURE, NET_HEADER_SIZE);
+  if (!have_v1_header && !have_v2_header)
   {
     // not a proxy protocol header
     return -1;
   }
-  memcpy(hdr, preread_bytes, 4);
-  hdr_len= 4;
+  memcpy(hdr, preread_bytes, NET_HEADER_SIZE);
+  pos= NET_HEADER_SIZE;
   Vio *vio= net->vio;
   memset(peer_info, 0, sizeof (*peer_info));
 
-  if (is_v1_header)
+  if (have_v1_header)
   {
-    while(hdr_len < sizeof(hdr))
+    /* Read until end of header (newline character)*/
+    while(pos < sizeof(hdr))
     {
-      long len= (long)vio_read(vio, hdr + hdr_len, 1);
+      long len= (long)vio_read(vio, hdr + pos, 1);
       if (len < 0)
         return -1;
-      hdr_len++;
-      if (hdr[hdr_len-1] == '\n')
+      pos++;
+      if (hdr[pos-1] == '\n')
         break;
     }
-    hdr[hdr_len]= 0;
+    hdr[pos]= 0;
 
-    if (parse_proxy_protocol_v1_header(hdr, hdr_len, peer_info))
+    if (parse_v1_header(hdr, pos, peer_info))
       return -1;
   }
-  else // if (is_v2_header)
+  else // if (have_v2_header)
   {
-    /* read off 16 bytes of the header*/
-    long len= vio_read(vio, hdr + 4, 12);
+#define PROXY_V2_HEADER_LEN 16
+    /* read off 16 bytes of the header. We assume we can read it without blocking.*/
+    long len= vio_read(vio, hdr + pos, PROXY_V2_HEADER_LEN - pos);
     if (len < 0)
       return -1;
     // 2 last bytes are the length in network byte order of the part following header
-    ushort trail_len= ((ushort)hdr[14] >> 8) + hdr[15];
-    if (trail_len > sizeof(hdr) - 16)
+    ushort trail_len= ((ushort)hdr[PROXY_V2_HEADER_LEN-2] >> 8) + hdr[PROXY_V2_HEADER_LEN-1];
+    if (trail_len > sizeof(hdr) - PROXY_V2_HEADER_LEN)
       return -1;
-    len= vio_read(vio,  hdr + 16, trail_len);
-    hdr_len= 16 + trail_len;
-    if (parse_proxy_protocol_v2_header(hdr, hdr_len, peer_info))
+    len= vio_read(vio,  hdr + PROXY_V2_HEADER_LEN, trail_len);
+    pos= PROXY_V2_HEADER_LEN + trail_len;
+    if (parse_v2_header(hdr, pos, peer_info))
       return -1;
   }
   return 0;
@@ -221,7 +246,7 @@ size_t  proxy_protocol_subnet_count;
 /**
   Convert string representation of a subnet to subnet struct.
 */
-static int parse_single_subnet(char *addr_str, struct subnet *subnet)
+static int parse_subnet(char *addr_str, struct subnet *subnet)
 {
   subnet->family= strchr(addr_str, ':') ? AF_INET6 : AF_INET;
 
@@ -254,7 +279,13 @@ static int parse_single_subnet(char *addr_str, struct subnet *subnet)
 }
 
 /**
-  Parse comma separated string subnet list into subnets array
+  Parse comma separated string subnet list into subnets array,
+  which is stored in 'proxy_protocol_subnets' variable
+
+  @param[in] subnets_str : networks in CIDR format,
+    separated by comma and/or space
+
+  @return 0 if success, otherwise -1
 */
 int set_proxy_protocol_networks(const char *subnets_str)
 {
@@ -291,7 +322,7 @@ int set_proxy_protocol_networks(const char *subnets_str)
     if (cnt ==  sizeof(token))
       return -1;
 
-    if (parse_single_subnet(token, &proxy_protocol_subnets[proxy_protocol_subnet_count]))
+    if (parse_subnet(token, &proxy_protocol_subnets[proxy_protocol_subnet_count]))
       return -1;
   }
   return 0;
@@ -311,7 +342,7 @@ static int compare_bits(const void *s1, const void *s2, int bit_count)
   int rem= byte_count % 8;
   if (rem)
   {
-    // compare remaining bits (
+    // compare remaining bits i.e partial bytes.
     unsigned char s1_bits= (((char *)s1)[byte_count]) >> (8 - rem);
     unsigned char s2_bits= (((char *)s2)[byte_count]) >> (8 - rem);
     if (s1_bits > s2_bits)
@@ -338,6 +369,13 @@ bool addr_matches_subnet(const sockaddr *sock_addr, const subnet *subnet)
 }
 
 
+/**
+  Check whether proxy header from client is allowed, as per
+  specification in 'proxy_protocol_networks' server variable.
+
+  The non-TCP "localhost" clients (unix socket, shared memory, pipes)
+  are accepted whenever 127.0.0.1 accepted  in 'proxy_protocol_networks'
+*/
 bool is_proxy_protocol_allowed(const sockaddr *addr, int len)
 {
   sockaddr_storage addr_storage;

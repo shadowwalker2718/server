@@ -861,7 +861,8 @@ static int handle_proxy_header(NET *net)
     /* proxy header indicates LOCAL connection, no action necessary */
     return 0;
 #ifdef EMBEDDED_LIBRARY
-   return 0;
+   DBUG_ABORT();
+   return 1;
 #else
   /* Change peer address in THD and ACL structures.*/
   return thd_set_peer_addr(thd, &(peer_info.peer_addr), NULL, peer_info.port);
