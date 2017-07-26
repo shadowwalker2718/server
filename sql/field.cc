@@ -42,7 +42,6 @@
 #include "filesort.h"                    // change_double_for_sort
 #include "log_event.h"                   // class Table_map_log_event
 #include <m_ctype.h>
-#include <zlib.h>
 
 // Maximum allowed exponent value for converting string to decimal
 #define MAX_EXPONENT 1024
@@ -5284,36 +5283,6 @@ static longlong read_lowendian(const uchar *from, uint bytes)
   }
 }
 
-static void store_bigendian(ulonglong num, uchar *to, uint bytes)
-{
-  switch(bytes) {
-  case 1: mi_int1store(to, num); break;
-  case 2: mi_int2store(to, num); break;
-  case 3: mi_int3store(to, num); break;
-  case 4: mi_int4store(to, num); break;
-  case 5: mi_int5store(to, num); break;
-  case 6: mi_int6store(to, num); break;
-  case 7: mi_int7store(to, num); break;
-  case 8: mi_int8store(to, num); break;
-  default: DBUG_ASSERT(0);
-  }
-}
-
-static longlong read_bigendian(const uchar *from, uint bytes)
-{
-  switch(bytes) {
-  case 1: return mi_uint1korr(from);
-  case 2: return mi_uint2korr(from);
-  case 3: return mi_uint3korr(from);
-  case 4: return mi_uint4korr(from);
-  case 5: return mi_uint5korr(from);
-  case 6: return mi_uint6korr(from);
-  case 7: return mi_uint7korr(from);
-  case 8: return mi_sint8korr(from);
-  default: DBUG_ASSERT(0); return 0;
-  }
-}
-
 void Field_timestamp_hires::store_TIME(my_time_t timestamp, ulong sec_part)
 {
   mi_int4store(ptr, timestamp);
@@ -7830,12 +7799,11 @@ void Field_varstring::hash(ulong *nr, ulong *nr2)
   followed by compressed data.
 */
 
-int Field_longstr::compress_zlib(char *to, uint *to_length,
-                                 const char *from, uint length,
-                                 CHARSET_INFO *cs)
+int Field_longstr::compress(char *to, uint *to_length,
+                            const char *from, uint length,
+                            CHARSET_INFO *cs)
 {
   THD *thd= get_thd();
-  uint level= thd->variables.column_compression_zlib_level;
   char *buf= 0;
   int rc= 0;
 
@@ -7865,43 +7833,17 @@ int Field_longstr::compress_zlib(char *to, uint *to_length,
     DBUG_ASSERT(length > 0);
   }
 
-  if (length >= thd->variables.column_compression_threshold && level > 0)
+  if (length >= thd->variables.column_compression_threshold &&
+      (*to_length= compression_method()->compress(thd, to, from, length)))
+    status_var_increment(thd->status_var.column_compressions);
+  else
   {
-    z_stream stream;
-    int wbits= thd->variables.column_compression_zlib_wrap ? MAX_WBITS :
-                                                            -MAX_WBITS;
-    uint strategy= thd->variables.column_compression_zlib_strategy;
-    /* Store only meaningful bytes of original data length. */
-    uchar original_pack_length= number_storage_requirement(length);
-
-    *to= 0x80 + original_pack_length + (wbits < 0 ? 8 : 0);
-    store_bigendian(length, (uchar*) to + 1, original_pack_length);
-
-    stream.avail_in= length;
-    stream.next_in= (Bytef*) from;
-
-    stream.avail_out= length - original_pack_length - 1;
-    stream.next_out= (Bytef*) to + original_pack_length + 1;
-
-    stream.zalloc= 0;
-    stream.zfree= 0;
-    stream.opaque= 0;
-
-    if (deflateInit2(&stream, level, Z_DEFLATED, wbits, 8, strategy) == Z_OK &&
-        deflate(&stream, Z_FINISH) == Z_STREAM_END &&
-        deflateEnd(&stream) == Z_OK)
-    {
-      *to_length= (uint) (stream.next_out - (Bytef*) to);
-      status_var_increment(thd->status_var.column_compressions);
-      goto end;
-    }
+    /* Store uncompressed */
+    to[0]= 0;
+    memcpy(to + 1, from, length);
+    *to_length= length + 1;
   }
 
-  /* Store uncompressed */
-  to[0]= 0;
-  memcpy(to + 1, from, length);
-  *to_length= length + 1;
-end:
   if (buf)
     my_free(buf);
   return rc;
@@ -7916,68 +7858,32 @@ end:
   or compressed data was longer than original data.
 */
 
-String *Field_longstr::uncompress_zlib(String *val_buffer, String *val_ptr,
-                                       const uchar *from, uint from_length)
+String *Field_longstr::uncompress(String *val_buffer, String *val_ptr,
+                                  const uchar *from, uint from_length)
 {
-  z_stream stream;
-  uchar method;
-  uchar original_pack_length;
-  int wbits;
-
-  if (!from_length)
-    goto end;
-
-  method= (*from & 0xF0) >> 4;
-  original_pack_length= *from & 0x07;
-  wbits= *from & 8 ? -MAX_WBITS : MAX_WBITS;
-
-  from++;
-  from_length--;
-
-  /* Uncompressed data */
-  if (!method)
+  if (from_length)
   {
-    val_ptr->set((const char*) from, from_length, field_charset);
-    return val_ptr;
+    uchar method= (*from & 0xF0) >> 4;
+
+    /* Uncompressed data */
+    if (!method)
+    {
+      val_ptr->set((const char*) from + 1, from_length - 1, field_charset);
+      return val_ptr;
+    }
+
+    if (compression_methods[method].uncompress)
+    {
+      if (!compression_methods[method].uncompress(val_buffer, from, from_length,
+                                                  field_length))
+      {
+        val_buffer->set_charset(field_charset);
+        status_var_increment(get_thd()->status_var.column_decompressions);
+        return val_buffer;
+      }
+    }
   }
 
-  if (from_length < original_pack_length)
-  {
-    my_error(ER_ZLIB_Z_DATA_ERROR, MYF(0));
-    goto end;
-  }
-
-  stream.avail_out= read_bigendian(from, original_pack_length);
-
-  if (stream.avail_out > field_length)
-  {
-    my_error(ER_ZLIB_Z_DATA_ERROR, MYF(0));
-    goto end;
-  }
-
-  if (val_buffer->alloc(stream.avail_out))
-    goto end;
-  stream.next_out= (Bytef*) val_buffer->ptr();
-
-  stream.avail_in= from_length - original_pack_length;
-  stream.next_in= (Bytef*) from + original_pack_length;
-
-  stream.zalloc= 0;
-  stream.zfree= 0;
-  stream.opaque= 0;
-
-  if (inflateInit2(&stream, wbits) == Z_OK &&
-      inflate(&stream, Z_FINISH) == Z_STREAM_END &&
-      inflateEnd(&stream) == Z_OK)
-  {
-    val_buffer->set_charset(field_charset);
-    val_buffer->length(stream.total_out);
-    status_var_increment(get_thd()->status_var.column_decompressions);
-    return val_buffer;
-  }
-  my_error(ER_ZLIB_Z_DATA_ERROR, MYF(0));
-
-end:
   /*
     It would be better to return 0 in case of errors, but to take the
     safer route, let's return a zero string and let the general
@@ -7993,7 +7899,7 @@ int Field_varstring_compressed::store(const char *from, uint length,
 {
   ASSERT_COLUMN_MARKED_FOR_WRITE_OR_COMPUTED;
   uint to_length= MY_MIN(field_length, field_charset->mbmaxlen * length + 1);
-  int rc= compress_zlib((char*) get_data(), &to_length, from, length, cs);
+  int rc= compress((char*) get_data(), &to_length, from, length, cs);
   store_length(to_length);
   return rc;
 }
@@ -8002,7 +7908,7 @@ int Field_varstring_compressed::store(const char *from, uint length,
 String *Field_varstring_compressed::val_str(String *val_buffer, String *val_ptr)
 {
   ASSERT_COLUMN_MARKED_FOR_READ;
-  return uncompress_zlib(val_buffer, val_ptr, get_data(), get_length());
+  return uncompress(val_buffer, val_ptr, get_data(), get_length());
 }
 
 
@@ -8565,7 +8471,7 @@ int Field_blob_compressed::store(const char *from, uint length,
     return -1;
   }
 
-  rc= compress_zlib((char*) value.ptr(), &to_length, from, length, cs);
+  rc= compress((char*) value.ptr(), &to_length, from, length, cs);
   set_ptr(to_length, (uchar*) value.ptr());
   return rc;
 }
@@ -8574,7 +8480,7 @@ int Field_blob_compressed::store(const char *from, uint length,
 String *Field_blob_compressed::val_str(String *val_buffer, String *val_ptr)
 {
   ASSERT_COLUMN_MARKED_FOR_READ;
-  return uncompress_zlib(val_buffer, val_ptr, get_ptr(), get_length());
+  return uncompress(val_buffer, val_ptr, get_ptr(), get_length());
 }
 
 
@@ -10644,7 +10550,7 @@ Field *make_field(TABLE_SHARE *share,
                             HA_VARCHAR_PACKLENGTH(field_length),
                             null_pos, null_bit,
                             unireg_check, field_name,
-                            share, field_charset);
+                            share, field_charset, zlib_compression_method);
 
         return new (mem_root)
           Field_varstring(ptr,field_length,
@@ -10677,7 +10583,7 @@ Field *make_field(TABLE_SHARE *share,
         return new (mem_root)
           Field_blob_compressed(ptr, null_pos, null_bit,
                      unireg_check, field_name, share,
-                     pack_length, field_charset);
+                     pack_length, field_charset, zlib_compression_method);
 
       return new (mem_root)
         Field_blob(ptr,null_pos,null_bit,
@@ -10864,13 +10770,17 @@ Column_definition::Column_definition(THD *thd, Field *old_field,
   vcol_info=  old_field->vcol_info;
   option_list= old_field->option_list;
   pack_flag= 0;
+  compression_method_ptr= 0;
 
   if (orig_field)
   {
     default_value= orig_field->default_value;
     check_constraint= orig_field->check_constraint;
     if (orig_field->unireg_check == Field::TMYSQL_COMPRESSED)
+    {
       unireg_check= Field::TMYSQL_COMPRESSED;
+      compression_method_ptr= zlib_compression_method;
+    }
   }
   else
   {
@@ -11045,9 +10955,10 @@ bool Column_definition::set_compressed(const char *method)
       sql_type == MYSQL_TYPE_BLOB || sql_type == MYSQL_TYPE_MEDIUM_BLOB ||
       sql_type == MYSQL_TYPE_LONG_BLOB)
   {
-    if (!method || !strcmp(method, "zlib"))
+    if (!method || !strcmp(method, zlib_compression_method->name))
     {
       unireg_check= Field::TMYSQL_COMPRESSED;
+      compression_method_ptr= zlib_compression_method;
       return false;
     }
     my_error(ER_UNKNOWN_COMPRESSION_METHOD, MYF(0), method);

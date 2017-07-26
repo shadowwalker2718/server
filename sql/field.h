@@ -32,6 +32,7 @@
 #include "sql_error.h"                          /* Sql_condition */
 #include "compat56.h"
 #include "sql_type.h"                           /* Type_std_attributes */
+#include "field_comp.h"
 
 class Send_field;
 class Copy_field;
@@ -1479,7 +1480,7 @@ public:
   /* Mark field in read map. Updates also virtual fields */
   void register_field_in_read_map();
 
-  virtual uchar compression_method() const { return 0; }
+  virtual Compression_method *compression_method() const { return 0; }
 
   friend int cre_myisam(char * name, register TABLE *form, uint options,
 			ulonglong auto_increment_value);
@@ -1717,11 +1718,11 @@ protected:
                                          const Item *item) const;
   bool cmp_to_string_with_stricter_collation(const Item_bool_func *cond,
                                              const Item *item) const;
-  int compress_zlib(char *to, uint *to_length,
-                    const char *from, uint length,
-                    CHARSET_INFO *cs);
-  String *uncompress_zlib(String *val_buffer, String *val_ptr,
-                          const uchar *from, uint from_length);
+  int compress(char *to, uint *to_length,
+               const char *from, uint length,
+               CHARSET_INFO *cs);
+  String *uncompress(String *val_buffer, String *val_ptr,
+                     const uchar *from, uint from_length);
 public:
   Field_longstr(uchar *ptr_arg, uint32 len_arg, uchar *null_ptr_arg,
                 uchar null_bit_arg, utype unireg_check_arg,
@@ -1749,8 +1750,6 @@ public:
   bool can_optimize_range(const Item_bool_func *cond,
                           const Item *item,
                           bool is_eq_func) const;
-  uint8 number_storage_requirement(uint32 length) const
-  { return length < 256 ? 1 : length < 65536 ? 2 : length < 16777216 ? 3 : 4; }
 };
 
 /* base class for float and double and decimal (old one) */
@@ -3192,17 +3191,22 @@ public:
                              uchar *null_ptr_arg, uchar null_bit_arg,
                              enum utype unireg_check_arg,
                              const char *field_name_arg,
-                             TABLE_SHARE *share, CHARSET_INFO *cs):
+                             TABLE_SHARE *share, CHARSET_INFO *cs,
+                             Compression_method *compression_method_arg):
     Field_varstring(ptr_arg, len_arg, length_bytes_arg, null_ptr_arg,
                     null_bit_arg, unireg_check_arg, field_name_arg,
-                    share, cs) { DBUG_ASSERT(len_arg > 0); }
-  uchar compression_method() const { return 8; }
+                    share, cs),
+    compression_method_ptr(compression_method_arg) { DBUG_ASSERT(len_arg > 0); }
+  Compression_method *compression_method() const
+  { return compression_method_ptr; }
 private:
+  Compression_method *compression_method_ptr;
   int store(const char *to, uint length, CHARSET_INFO *charset);
   using Field_str::store;
   String *val_str(String *, String *);
   double val_real(void);
   longlong val_int(void);
+  uint size_of() const { return sizeof(*this); }
 
   /*
     Compressed fields can't have keys as two rows may have different
@@ -3217,6 +3221,44 @@ private:
                        uchar *new_null_ptr, uint new_null_bit)
   { DBUG_ASSERT(0); return 0; }
 };
+
+
+static inline uint8 number_storage_requirement(uint32 n)
+{
+  return n < 256 ? 1 : n < 65536 ? 2 : n < 16777216 ? 3 : 4;
+}
+
+
+static inline void store_bigendian(ulonglong num, uchar *to, uint bytes)
+{
+  switch(bytes) {
+  case 1: mi_int1store(to, num); break;
+  case 2: mi_int2store(to, num); break;
+  case 3: mi_int3store(to, num); break;
+  case 4: mi_int4store(to, num); break;
+  case 5: mi_int5store(to, num); break;
+  case 6: mi_int6store(to, num); break;
+  case 7: mi_int7store(to, num); break;
+  case 8: mi_int8store(to, num); break;
+  default: DBUG_ASSERT(0);
+  }
+}
+
+
+static inline longlong read_bigendian(const uchar *from, uint bytes)
+{
+  switch(bytes) {
+  case 1: return mi_uint1korr(from);
+  case 2: return mi_uint2korr(from);
+  case 3: return mi_uint3korr(from);
+  case 4: return mi_uint4korr(from);
+  case 5: return mi_uint5korr(from);
+  case 6: return mi_uint6korr(from);
+  case 7: return mi_uint7korr(from);
+  case 8: return mi_sint8korr(from);
+  default: DBUG_ASSERT(0); return 0;
+  }
+}
 
 
 class Field_blob :public Field_longstr {
@@ -3438,16 +3480,21 @@ public:
   Field_blob_compressed(uchar *ptr_arg, uchar *null_ptr_arg,
                         uchar null_bit_arg, enum utype unireg_check_arg,
                         const char *field_name_arg, TABLE_SHARE *share,
-                        uint blob_pack_length, CHARSET_INFO *cs):
+                        uint blob_pack_length, CHARSET_INFO *cs,
+                        Compression_method *compression_method_arg):
     Field_blob(ptr_arg, null_ptr_arg, null_bit_arg, unireg_check_arg,
-               field_name_arg, share, blob_pack_length, cs) {}
-  uchar compression_method() const { return 8; }
+               field_name_arg, share, blob_pack_length, cs),
+    compression_method_ptr(compression_method_arg) {}
+  Compression_method *compression_method() const
+  { return compression_method_ptr; }
 private:
+  Compression_method *compression_method_ptr;
   int store(const char *to, uint length, CHARSET_INFO *charset);
   using Field_str::store;
   String *val_str(String *, String *);
   double val_real(void);
   longlong val_int(void);
+  uint size_of() const { return sizeof(*this); }
 
   /*
     Compressed fields can't have keys as two rows may have different
@@ -3884,6 +3931,7 @@ class Column_definition: public Sql_alloc
       set_if_bigger(*max_length, (uint32)length);
     }
   }
+  Compression_method *compression_method_ptr;
 public:
   const char *field_name;
   LEX_STRING comment;			// Comment for field
@@ -3921,6 +3969,7 @@ public:
     *check_constraint;               // Check constraint
 
   Column_definition():
+    compression_method_ptr(0),
     comment(null_lex_str),
     on_update(NULL), sql_type(MYSQL_TYPE_NULL), length(0), decimals(0),
     flags(0), pack_length(0), key_length(0), unireg_check(Field::NONE),
@@ -3933,6 +3982,7 @@ public:
   }
 
   Column_definition(const char *name, enum_field_types type):
+    compression_method_ptr(0),
     field_name(name),
     comment(null_lex_str),
     on_update(NULL), sql_type(type), length(0), decimals(0),
@@ -4037,16 +4087,8 @@ public:
     *this= *def;
   }
   bool set_compressed(const char *method);
-  uchar compression_method() const
-  {
-    /* We can't use f_is_blob here as pack_flag is not yet set */
-    if ((sql_type == MYSQL_TYPE_VARCHAR || sql_type == MYSQL_TYPE_TINY_BLOB ||
-         sql_type == MYSQL_TYPE_BLOB || sql_type == MYSQL_TYPE_MEDIUM_BLOB ||
-         sql_type == MYSQL_TYPE_LONG_BLOB) &&
-        unireg_check == Field::TMYSQL_COMPRESSED)
-      return 8;
-    return 0;
-  }
+  Compression_method *compression_method() const
+  { return compression_method_ptr; }
 };
 
 
