@@ -8421,11 +8421,9 @@ const uchar *Field_blob::unpack(uchar *to, const uchar *from,
     DBUG_RETURN(0);                             // Error in data
   uint32 const length= get_length(from, master_packlength);
   DBUG_DUMP("packed", from, length + master_packlength);
-  bitmap_set_bit(table->write_set, field_index);
   if (from + master_packlength + length > from_end)
     DBUG_RETURN(0);
-  store(reinterpret_cast<const char*>(from) + master_packlength,
-        length, field_charset);
+  set_ptr(length, const_cast<uchar*> (from) + master_packlength);
   DBUG_DUMP("record", to, table->s->reclength);
   DBUG_RETURN(from + master_packlength + length);
 }
