@@ -7555,7 +7555,8 @@ void Field_varstring::sql_type(String &res) const
   length= cs->cset->snprintf(cs,(char*) res.ptr(),
                              res.alloced_length(), "%s(%d)",
                               (has_charset() ? "varchar" : "varbinary"),
-                             (int) field_length / charset()->mbmaxlen);
+                             (int) field_length / charset()->mbmaxlen -
+                             MY_TEST(compression_method()));
   res.length(length);
   if ((thd->variables.sql_mode & (MODE_MYSQL323 | MODE_MYSQL40)) &&
       has_charset() && (charset()->state & MY_CS_BINSORT))
@@ -10015,6 +10016,8 @@ void Column_definition::create_length_to_internal_length(void)
   case MYSQL_TYPE_STRING:
   case MYSQL_TYPE_VARCHAR:
     length*= charset->mbmaxlen;
+    if (sql_type == MYSQL_TYPE_VARCHAR && compression_method())
+      length++;
     key_length= length;
     pack_length= calc_pack_length(sql_type, length);
     break;
@@ -10812,7 +10815,8 @@ Column_definition::Column_definition(THD *thd, Field *old_field,
   case MYSQL_TYPE_VARCHAR:
   case MYSQL_TYPE_VAR_STRING:
     /* This is corrected in create_length_to_internal_length */
-    length= (length+charset->mbmaxlen-1) / charset->mbmaxlen;
+    length= (length+charset->mbmaxlen-1) / charset->mbmaxlen -
+            MY_TEST(old_field->compression_method());
     break;
 #ifdef HAVE_SPATIAL
   case MYSQL_TYPE_GEOMETRY:

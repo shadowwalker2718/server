@@ -3392,6 +3392,7 @@ mysql_prepare_create_table(THD *thd, HA_CREATE_INFO *create_info,
           if (!(sql_field->flags & NOT_NULL_FLAG))
             null_fields--;
 	  sql_field->flags=		dup_field->flags;
+          sql_field->set_compression_method(dup_field->compression_method());
 	  sql_field->create_length_to_internal_length();
           sql_field->interval=          dup_field->interval;
           sql_field->vcol_info=         dup_field->vcol_info;

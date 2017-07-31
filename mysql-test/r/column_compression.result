@@ -1179,8 +1179,8 @@ t1	CREATE TABLE `t1` (
 ) ENGINE=CSV DEFAULT CHARSET=latin1
 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 DROP TABLE t1;
-# Test fields with length equal to data length
-CREATE TABLE t1(a VARCHAR(10) COMPRESSED);
+# Test fields that don't fit data
+CREATE TABLE t1(a VARCHAR(9) COMPRESSED);
 INSERT INTO t1 VALUES(REPEAT('a', 10));
 ERROR 22001: Data too long for column 'a' at row 1
 INSERT INTO t1 VALUES(REPEAT(' ', 10));
@@ -1201,4 +1201,18 @@ SET column_compression_threshold=DEFAULT;
 SELECT a, LENGTH(a) FROM t1;
 a	LENGTH(a)
                                                                                                                                                                                                                                                               	254
+DROP TABLE t1;
+# Corner case: VARCHAR(255) COMPRESSED must have 2 bytes pack length
+CREATE TABLE t1(a VARCHAR(255) COMPRESSED);
+SHOW CREATE TABLE t1;
+Table	Create Table
+t1	CREATE TABLE `t1` (
+  `a` varchar(255) DEFAULT NULL /*!100301 COMPRESSED*/
+) ENGINE=MyISAM DEFAULT CHARSET=latin1
+SET column_compression_threshold=300;
+INSERT INTO t1 VALUES(REPEAT('a', 255));
+SET column_compression_threshold=DEFAULT;
+SELECT a, LENGTH(a) FROM t1;
+a	LENGTH(a)
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	255
 DROP TABLE t1;

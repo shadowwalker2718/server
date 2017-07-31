@@ -4087,6 +4087,8 @@ public:
     *this= *def;
   }
   bool set_compressed(const char *method);
+  void set_compression_method(Compression_method *compression_method_arg)
+  { compression_method_ptr= compression_method_arg; }
   Compression_method *compression_method() const
   { return compression_method_ptr; }
 };
