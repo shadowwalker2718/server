@@ -125,7 +125,7 @@ public:
 
 
 bool
-check_routine_name(LEX_CSTRING *ident);
+check_routine_name(const LEX_CSTRING *ident);
 
 class sp_head :private Query_arena,
                public Database_qualified_name
@@ -133,6 +133,7 @@ class sp_head :private Query_arena,
   sp_head(const sp_head &);	/**< Prevent use of these */
   void operator=(sp_head &);
 
+protected:
   MEM_ROOT main_mem_root;
 public:
   /** Possible values of m_flags */
@@ -168,6 +169,7 @@ public:
     HAS_COLUMN_TYPE_REFS= 8192
   };
 
+  sp_package *m_parent;
   const Sp_handler *m_handler;
   uint m_flags;                 // Boolean attributes of a stored routine
 
@@ -217,6 +219,7 @@ public:
 
   sp_rcontext *rcontext_create(THD *thd, Field *retval);
 
+  bool eq_routine_spec(const sp_head *) const;
 private:
   /**
     Version of the stored routine cache at the moment when the
@@ -312,7 +315,7 @@ public:
   static void
   operator delete(void *ptr, size_t size) throw ();
 
-  sp_head(const Sp_handler *handler);
+  sp_head(sp_package *m_parent, const Sp_handler *handler);
 
   /// Initialize after we have reset mem_root
   void
@@ -321,6 +324,10 @@ public:
   /** Copy sp name from parser. */
   void
   init_sp_name(THD *thd, const sp_name *spname);
+
+  void
+  init_sp_name(MEM_ROOT *mem_root,
+               const Database_qualified_name *name, bool explicit_name);
 
   /** Set the body-definition start position. */
   void
@@ -400,6 +407,7 @@ public:
                                             sp_variable *spv,
                                             const LEX_CSTRING *field_name,
                                             Item *val, LEX *lex);
+  bool check_package_routine_end_name(const LEX_CSTRING &end_name) const;
 private:
   /**
     Generate a code to set a single cursor parameter variable.
@@ -791,7 +799,31 @@ public:
 
   sp_pcontext *get_parse_context() { return m_pcont; }
 
-private:
+  /*
+    Check EXECUTE access:
+    - in case of a standalone rotuine, for the routine itself
+    - in case of a package routine, for the owner package body
+  */
+  bool check_execute_access(THD *thd) const;
+
+  virtual bool add_routine_declaration(THD *thd, LEX *lex)
+  {
+    DBUG_ASSERT(0);
+    return true;
+  }
+
+  virtual bool add_routine_implementation(THD *thd, LEX *lex)
+  {
+    DBUG_ASSERT(0);
+    return true;
+  }
+
+  virtual sp_package *get_package()
+  {
+    return NULL;
+  }
+
+protected:
 
   MEM_ROOT *m_thd_root;		///< Temp. store for thd's mem_root
   THD *m_thd;			///< Set if we have reset mem_root
@@ -854,6 +886,47 @@ private:
                  backpatch_instr_type itype);
 
 }; // class sp_head : public Sql_alloc
+
+
+class sp_package: public sp_head
+{
+  void cleanup()
+  {
+    m_routine_implementations.cleanup();
+    m_routine_declarations.cleanup();
+    m_body= null_clex_str;
+  }
+public:
+  class LexList: public List<LEX>
+  {
+  public:
+    LexList() { elements= 0; }
+    LEX *find(const LEX_CSTRING &name, stored_procedure_type type);
+    void cleanup();
+  };
+  LexList m_routine_implementations;
+  LexList m_routine_declarations;
+  struct LEX *m_top_level_lex;
+  bool m_is_instantiated;
+  sp_package(LEX *top_level_lex,
+             const sp_name *name,
+             const Sp_handler *sph);
+  ~sp_package() { cleanup(); }
+  bool add_routine_declaration(THD *thd, LEX *lex);
+  bool add_routine_implementation(THD *thd, LEX *lex);
+  sp_package *get_package() { return this; }
+  sp_variable *find_package_variable(const LEX_CSTRING *name) const
+  {
+   /*
+     sp_head::m_pcont is a special level for routine parameters.
+     Variables declared inside CREATE PACKAGE BODY reside in m_children.at(0).
+   */
+   sp_pcontext *ctx= m_pcont->child_context(0);
+   return ctx ? ctx->find_variable(name, true) : NULL;
+ }
+ bool validate_after_parser(THD *thd);
+ bool instantiate_if_needed(THD *thd);
+};
 
 
 class sp_lex_cursor: public sp_lex_local, public Query_arena

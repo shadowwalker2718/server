@@ -932,6 +932,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  BIT_XOR                       /* MYSQL-FUNC */
 %token  BLOB_SYM                      /* SQL-2003-R */
 %token  BLOCK_SYM
+%token  BODY_SYM                      /* Oracle-R   */
 %token  BOOLEAN_SYM                   /* SQL-2003-R */
 %token  BOOL_SYM
 %token  BOTH                          /* SQL-2003-R */
@@ -1314,6 +1315,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  OUT_SYM                       /* SQL-2003-R */
 %token  OVER_SYM
 %token  OWNER_SYM
+%token  PACKAGE_SYM                   /* Oracle-R */
 %token  PACK_KEYS_SYM
 %token  PAGE_SYM
 %token  PAGE_CHECKSUM_SYM
@@ -2946,8 +2948,9 @@ ev_sql_stmt:
             if (lex->sphead)
               my_yyabort_error((ER_EVENT_RECURSION_FORBIDDEN, MYF(0)));
               
-            if (!lex->make_sp_head(thd, lex->event_parse_data->identifier,
-                                        &sp_handler_procedure))
+            if (!lex->make_sp_head(thd, NULL,
+                                   lex->event_parse_data->identifier,
+                                   &sp_handler_procedure))
               MYSQL_YYABORT;
 
             lex->sphead->set_body_start(thd, lip->get_cpp_ptr());
@@ -3040,12 +3043,8 @@ sp_suid:
 call:
           CALL_SYM sp_name
           {
-            LEX *lex = Lex;
-
-            lex->sql_command= SQLCOM_CALL;
-            lex->spname= $2;
-            lex->value_list.empty();
-            sp_handler_procedure.add_used_routine(lex, thd, $2);
+            if (Lex->call_statement_start(thd, $2))
+              MYSQL_YYABORT;
           }
           opt_sp_cparam_list {}
         ;
@@ -13166,6 +13165,18 @@ show_param:
             lex->sql_command = SQLCOM_SHOW_CREATE_FUNC;
             lex->spname= $3;
           }
+        | CREATE PACKAGE_SYM sp_name
+          {
+            LEX *lex= Lex;
+            lex->sql_command = SQLCOM_SHOW_CREATE_PACKAGE;
+            lex->spname= $3;
+          }
+        | CREATE PACKAGE_SYM BODY_SYM sp_name
+          {
+            LEX *lex= Lex;
+            lex->sql_command = SQLCOM_SHOW_CREATE_PACKAGE_BODY;
+            lex->spname= $4;
+          }
         | CREATE TRIGGER_SYM sp_name
           {
             LEX *lex= Lex;
@@ -13198,6 +13209,20 @@ show_param:
             if (prepare_schema_table(thd, lex, 0, SCH_PROCEDURES))
               MYSQL_YYABORT;
           }
+        | PACKAGE_SYM STATUS_SYM wild_and_where
+          {
+            LEX *lex= Lex;
+            lex->sql_command= SQLCOM_SHOW_STATUS_PACKAGE;
+            if (prepare_schema_table(thd, lex, 0, SCH_PROCEDURES))
+              MYSQL_YYABORT;
+          }
+        | PACKAGE_SYM BODY_SYM STATUS_SYM wild_and_where
+          {
+            LEX *lex= Lex;
+            lex->sql_command= SQLCOM_SHOW_STATUS_PACKAGE_BODY;
+            if (prepare_schema_table(thd, lex, 0, SCH_PROCEDURES))
+              MYSQL_YYABORT;
+          }
         | PROCEDURE_SYM CODE_SYM sp_name
           {
             Lex->sql_command= SQLCOM_SHOW_PROC_CODE;
@@ -13207,6 +13232,11 @@ show_param:
           {
             Lex->sql_command= SQLCOM_SHOW_FUNC_CODE;
             Lex->spname= $3;
+          }
+        | PACKAGE_SYM BODY_SYM CODE_SYM sp_name
+          {
+            Lex->sql_command= SQLCOM_SHOW_PACKAGE_BODY_CODE;
+            Lex->spname= $4;
           }
         | CREATE EVENT_SYM sp_name
           {
@@ -14689,6 +14719,7 @@ keyword_sp_not_data_type:
         | AVG_ROW_LENGTH           {}
         | AVG_SYM                  {}
         | BLOCK_SYM                {}
+        | BODY_SYM                 {}
         | BTREE_SYM                {}
         | CASCADED                 {}
         | CATALOG_NAME_SYM         {}
@@ -14860,6 +14891,7 @@ keyword_sp_not_data_type:
         | ONE_SYM                  {}
         | ONLINE_SYM               {}
         | ONLY_SYM                 {}
+        | PACKAGE_SYM              {}
         | PACK_KEYS_SYM            {}
         | PAGE_SYM                 {}
         | PARTIAL                  {}
@@ -15172,14 +15204,8 @@ option_value_no_option_type:
           }
         | '@' ident_or_text equal expr
           {
-            Item_func_set_user_var *item;
-            item= new (thd->mem_root) Item_func_set_user_var(thd, &$2, $4);
-            if (item == NULL)
+            if (Lex->set_user_variable(thd, &$2, $4))
               MYSQL_YYABORT;
-            set_var_user *var= new (thd->mem_root) set_var_user(item);
-            if (var == NULL)
-              MYSQL_YYABORT;
-            Lex->var_list.push_back(var, thd->mem_root);
           }
         | '@' '@' opt_var_ident_type internal_variable_name equal set_expr_or_default
           {
@@ -15584,25 +15610,13 @@ revoke_command:
           }
         | grant_privileges ON FUNCTION_SYM grant_ident FROM user_and_role_list
           {
-            LEX *lex= Lex;
-            if (lex->columns.elements)
-            {
-              thd->parse_error();
+            if (Lex->add_grant_command(thd, SQLCOM_REVOKE, TYPE_ENUM_FUNCTION))
               MYSQL_YYABORT;
-            }
-            lex->sql_command= SQLCOM_REVOKE;
-            lex->type= TYPE_ENUM_FUNCTION;
           }
         | grant_privileges ON PROCEDURE_SYM grant_ident FROM user_and_role_list
           {
-            LEX *lex= Lex;
-            if (lex->columns.elements)
-            {
-              thd->parse_error();
+            if (Lex->add_grant_command(thd, SQLCOM_REVOKE, TYPE_ENUM_PROCEDURE))
               MYSQL_YYABORT;
-            }
-            lex->sql_command= SQLCOM_REVOKE;
-            lex->type= TYPE_ENUM_PROCEDURE;
           }
         | ALL opt_privileges ',' GRANT OPTION FROM user_and_role_list
           {
@@ -15646,26 +15660,14 @@ grant_command:
         | grant_privileges ON FUNCTION_SYM grant_ident TO_SYM grant_list
           opt_require_clause opt_grant_options
           {
-            LEX *lex= Lex;
-            if (lex->columns.elements)
-            {
-              thd->parse_error();
+            if (Lex->add_grant_command(thd, SQLCOM_GRANT, TYPE_ENUM_FUNCTION))
               MYSQL_YYABORT;
-            }
-            lex->sql_command= SQLCOM_GRANT;
-            lex->type= TYPE_ENUM_FUNCTION;
           }
         | grant_privileges ON PROCEDURE_SYM grant_ident TO_SYM grant_list
           opt_require_clause opt_grant_options
           {
-            LEX *lex= Lex;
-            if (lex->columns.elements)
-            {
-              thd->parse_error();
+            if (Lex->add_grant_command(thd, SQLCOM_GRANT, TYPE_ENUM_PROCEDURE))
               MYSQL_YYABORT;
-            }
-            lex->sql_command= SQLCOM_GRANT;
-            lex->type= TYPE_ENUM_PROCEDURE;
           }
         | PROXY_SYM ON user TO_SYM grant_list opt_grant_option
           {
@@ -16577,7 +16579,7 @@ trigger_tail:
             (*static_cast<st_trg_execution_order*>(&lex->trg_chistics))= ($17);
             lex->trg_chistics.ordering_clause_end= lip->get_cpp_ptr();
 
-            if (!lex->make_sp_head(thd, $4, &sp_handler_trigger))
+            if (!lex->make_sp_head(thd, NULL, $4, &sp_handler_trigger))
               MYSQL_YYABORT;
 
             lex->sphead->set_body_start(thd, lip->get_cpp_tok_start());
@@ -16650,7 +16652,7 @@ sf_tail:
           opt_if_not_exists
           sp_name
           {
-            if (!Lex->make_sp_head_no_recursive(thd, $1, $2,
+            if (!Lex->make_sp_head_no_recursive(thd, NULL, $1, $2,
                                                 &sp_handler_function))
               MYSQL_YYABORT;
           }
@@ -16685,7 +16687,7 @@ sf_tail:
 sp_tail:
           opt_if_not_exists sp_name
           {
-            if (!Lex->make_sp_head_no_recursive(thd, $1, $2,
+            if (!Lex->make_sp_head_no_recursive(thd, NULL, $1, $2,
                                                 &sp_handler_procedure))
               MYSQL_YYABORT;
           }

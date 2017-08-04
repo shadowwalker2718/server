@@ -187,6 +187,8 @@ sp_get_flags_for_command(LEX *lex)
   case SQLCOM_SHOW_CREATE_DB:
   case SQLCOM_SHOW_CREATE_FUNC:
   case SQLCOM_SHOW_CREATE_PROC:
+  case SQLCOM_SHOW_CREATE_PACKAGE:
+  case SQLCOM_SHOW_CREATE_PACKAGE_BODY:
   case SQLCOM_SHOW_CREATE_EVENT:
   case SQLCOM_SHOW_CREATE_TRIGGER:
   case SQLCOM_SHOW_CREATE_USER:
@@ -206,11 +208,14 @@ sp_get_flags_for_command(LEX *lex)
   case SQLCOM_SHOW_PRIVILEGES:
   case SQLCOM_SHOW_PROCESSLIST:
   case SQLCOM_SHOW_PROC_CODE:
+  case SQLCOM_SHOW_PACKAGE_BODY_CODE:
   case SQLCOM_SHOW_SLAVE_HOSTS:
   case SQLCOM_SHOW_SLAVE_STAT:
   case SQLCOM_SHOW_STATUS:
   case SQLCOM_SHOW_STATUS_FUNC:
   case SQLCOM_SHOW_STATUS_PROC:
+  case SQLCOM_SHOW_STATUS_PACKAGE:
+  case SQLCOM_SHOW_STATUS_PACKAGE_BODY:
   case SQLCOM_SHOW_STORAGE_ENGINES:
   case SQLCOM_SHOW_TABLES:
   case SQLCOM_SHOW_TABLE_STATUS:
@@ -255,6 +260,8 @@ sp_get_flags_for_command(LEX *lex)
     break;
   case SQLCOM_CREATE_INDEX:
   case SQLCOM_CREATE_DB:
+  case SQLCOM_CREATE_PACKAGE:
+  case SQLCOM_CREATE_PACKAGE_BODY:
   case SQLCOM_CREATE_VIEW:
   case SQLCOM_CREATE_TRIGGER:
   case SQLCOM_CREATE_USER:
@@ -271,6 +278,8 @@ sp_get_flags_for_command(LEX *lex)
   case SQLCOM_RENAME_USER:
   case SQLCOM_DROP_INDEX:
   case SQLCOM_DROP_DB:
+  case SQLCOM_DROP_PACKAGE:
+  case SQLCOM_DROP_PACKAGE_BODY:
   case SQLCOM_REVOKE_ALL:
   case SQLCOM_DROP_USER:
   case SQLCOM_DROP_ROLE:
@@ -480,7 +489,7 @@ sp_name::sp_name(const MDL_key *key, char *qname_buff)
 */
 
 bool
-check_routine_name(LEX_CSTRING *ident)
+check_routine_name(const LEX_CSTRING *ident)
 {
   DBUG_ASSERT(ident);
   DBUG_ASSERT(ident->str);
@@ -540,9 +549,10 @@ sp_head::operator delete(void *ptr, size_t size) throw()
 }
 
 
-sp_head::sp_head(const Sp_handler *sph)
+sp_head::sp_head(sp_package *parent, const Sp_handler *sph)
   :Query_arena(&main_mem_root, STMT_INITIALIZED_FOR_SP),
    Database_qualified_name(&null_clex_str, &null_clex_str),
+   m_parent(parent),
    m_handler(sph),
    m_flags(0),
    m_explicit_name(false),
@@ -566,6 +576,9 @@ sp_head::sp_head(const Sp_handler *sph)
    m_param_begin(NULL),
    m_param_end(NULL),
    m_body_begin(NULL),
+   m_thd_root(NULL),
+   m_thd(NULL),
+   m_pcont(new (&main_mem_root) sp_pcontext()),
    m_cont_level(0)
 {
   m_first_instance= this;
@@ -580,6 +593,7 @@ sp_head::sp_head(const Sp_handler *sph)
   m_backpatch_goto.empty();
   m_cont_backpatch.empty();
   m_lex.empty();
+  my_init_dynamic_array(&m_instr, sizeof(sp_instr *), 16, 8, MYF(0));
   my_hash_init(&m_sptabs, system_charset_info, 0, 0, 0, sp_table_key, 0, 0);
   my_hash_init(&m_sroutines, system_charset_info, 0, 0, 0, sp_sroutine_key,
                0, 0);
@@ -588,12 +602,105 @@ sp_head::sp_head(const Sp_handler *sph)
 }
 
 
+sp_package::sp_package(LEX *top_level_lex,
+                       const sp_name *name,
+                       const Sp_handler *sph)
+ :sp_head(NULL, sph),
+  m_top_level_lex(top_level_lex),
+  m_is_instantiated(false)
+{
+  init_sp_name(&main_mem_root, name, name->m_explicit_name);
+}
+
+
+bool sp_package::add_routine_declaration(THD *thd, LEX *lex)
+{
+  DBUG_ASSERT(thd->mem_root == &main_mem_root);
+  return m_routine_declarations.push_back(lex, thd->mem_root);
+}
+
+
+bool sp_package::add_routine_implementation(THD *thd, LEX *lex)
+{
+  DBUG_ASSERT(thd->mem_root == &main_mem_root);
+  return m_routine_implementations.push_back(lex, thd->mem_root);
+}
+
+
+/*
+  Test if two routines have equal specifications
+*/
+bool sp_head::eq_routine_spec(const sp_head *sp) const
+{
+  // TODO: Add tests for equal return data types (in case of FUNCTION
+  // TODO: Add tests for equal argument data types
+  return
+    m_handler->type() == sp->m_handler->type() &&
+    m_pcont->context_var_count() == sp->m_pcont->context_var_count();
+}
+
+
+bool sp_package::validate_after_parser(THD *thd)
+{
+  if (m_handler->type() != TYPE_ENUM_PACKAGE_BODY)
+    return false;
+  /*
+    Check that all routines declared in CREATE PACKAGE
+    have implementations in CREATE PACKAGE BODY.
+  */
+  sp_head *sp= sp_cache_lookup(&thd->sp_package_spec_cache, this);
+  sp_package *pkg= sp ? sp->get_package() : NULL;
+  DBUG_ASSERT(pkg); // CREATE PACKAGE must already be cached
+  List_iterator<LEX> it(pkg->m_routine_declarations);
+  for (LEX *lex; (lex= it++); )
+  {
+    bool found= false;
+    DBUG_ASSERT(lex->sphead);
+    List_iterator<LEX> it2(m_routine_implementations);
+    for (LEX *lex2; (lex2= it2++); )
+    {
+      DBUG_ASSERT(lex2->sphead);
+      if (!strcmp(lex2->sphead->m_name.str, lex->sphead->m_name.str) &&
+          lex2->sphead->eq_routine_spec(lex->sphead))
+      {
+        found= true;
+        break;
+      }
+    }
+    if (!found)
+    {
+      my_error(ER_PACKAGE_ROUTINE_IN_SPEC_NOT_DEFINED_IN_BODY, MYF(0),
+               ErrConvDQName(lex->sphead).ptr());
+      return true;
+    }
+  }
+  return false;
+}
+
+
+LEX *sp_package::LexList::find(const LEX_CSTRING &name,
+                               stored_procedure_type type)
+{
+  List_iterator<LEX> it(*this);
+  for (LEX *lex; (lex= it++); )
+  {
+    DBUG_ASSERT(lex->sphead);
+    const char *dot;
+    if (lex->sphead->m_handler->type() == type &&
+        (dot= strchr(lex->sphead->m_name.str, '.')) &&
+        !strcmp(dot + 1, name.str))
+      return lex;
+  }
+  return NULL;
+}
+
+
 void
 sp_head::init(LEX *lex)
 {
   DBUG_ENTER("sp_head::init");
 
-  lex->spcont= m_pcont= new sp_pcontext();
+  lex->spcont= m_pcont;
 
   if (!lex->spcont)
     DBUG_VOID_RETURN;
@@ -603,9 +710,21 @@ sp_head::init(LEX *lex)
     types of stored procedures to simplify reset_lex()/restore_lex() code.
   */
   lex->trg_table_fields.empty();
-  my_init_dynamic_array(&m_instr, sizeof(sp_instr *), 16, 8, MYF(0));
 
   DBUG_VOID_RETURN;
+}
+
+
+void
+sp_head::init_sp_name(MEM_ROOT *mem_root,
+                      const Database_qualified_name *spname,
+                      bool explicit_name)
+{
+  /* Must be initialized in the parser. */
+  DBUG_ASSERT(spname && spname->m_db.str && spname->m_db.length);
+  /* We have to copy strings to get them into the right memroot. */
+  Database_qualified_name::copy(mem_root, *spname);
+  m_explicit_name= explicit_name;
 }
 
 
@@ -614,21 +733,7 @@ sp_head::init_sp_name(THD *thd, const sp_name *spname)
 {
   DBUG_ENTER("sp_head::init_sp_name");
 
-  /* Must be initialized in the parser. */
-
-  DBUG_ASSERT(spname && spname->m_db.str && spname->m_db.length);
-
-  /* We have to copy strings to get them into the right memroot. */
-
-  m_db.length= spname->m_db.length;
-  m_db.str= strmake_root(thd->mem_root, spname->m_db.str, spname->m_db.length);
-
-  m_name.length= spname->m_name.length;
-  m_name.str= strmake_root(thd->mem_root, spname->m_name.str,
-                           spname->m_name.length);
-
-  m_explicit_name= spname->m_explicit_name;
-
+  init_sp_name(thd->mem_root, spname, spname->m_explicit_name);
   spname->make_qname(thd, &m_qname);
 
   DBUG_VOID_RETURN;
@@ -723,6 +828,17 @@ sp_head::~sp_head()
   delete m_next_cached_sp;
 
   DBUG_VOID_RETURN;
+}
+
+
+void sp_package::LexList::cleanup()
+{
+  List_iterator<LEX> it(*this);
+  for (LEX *lex; (lex= it++); )
+  {
+    lex_end(lex);
+    delete lex;
+  }
 }
 
 
@@ -1424,6 +1540,25 @@ set_routine_security_ctx(THD *thd, sp_head *sp, Security_context **save_ctx)
 #endif // ! NO_EMBEDDED_ACCESS_CHECKS
 
 
+bool sp_head::check_execute_access(THD *thd) const
+{
+  // Should not be called for packages
+  DBUG_ASSERT(!((sp_head*)this)->get_package());
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  return m_parent ?
+    check_routine_access(thd, EXECUTE_ACL,
+                         m_parent->m_db.str,
+                         m_parent->m_name.str,
+                         &sp_handler_package_body, false) :
+    check_routine_access(thd, EXECUTE_ACL,
+                         m_db.str, m_name.str,
+                         m_handler, false);
+#else
+  return false;
+#endif
+}
+
+
 /**
   Create rcontext using the routine security.
   This is important for sql_mode=ORACLE to make sure that the invoker has
@@ -1587,6 +1722,45 @@ err_with_cleanup:
 }
 
 
+/*
+  Execute the package initialization section.
+  TODO: if the package initialization section uses tables,
+  they must be added into the currently executed package routine
+  using sp_add_used_routines().
+*/
+bool sp_package::instantiate_if_needed(THD *thd)
+{
+  List<Item> args;
+  if (m_is_instantiated)
+    return false;
+  /*
+    Set m_is_instantiated to true early, to avoid recursion in case if
+    the package initialization section calls routines from the same package.
+  */
+  m_is_instantiated= true;
+  /*
+    Check that the stored procedure doesn't contain Dynamic SQL
+    and doesn't return result sets: such stored procedures can't
+    be called from a function or trigger.
+  */
+  if (thd->in_sub_stmt)
+  {
+    const char *where= (thd->in_sub_stmt & SUB_STMT_TRIGGER ?
+                        "trigger" : "function");
+    if (is_not_allowed_in_function(where))
+      goto err;
+  }
+
+  args.elements= 0;
+  if (execute_procedure(thd, &args))
+    goto err;
+  return false;
+err:
+  m_is_instantiated= false;
+  return true;
+}
+
+
 /**
   Execute a function.
 
@@ -1637,6 +1811,9 @@ sp_head::execute_function(THD *thd, Item **argp, uint argcount,
   Query_arena backup_arena;
   DBUG_ENTER("sp_head::execute_function");
   DBUG_PRINT("info", ("function %s", m_name.str));
+
+  if (m_parent && m_parent->instantiate_if_needed(thd))
+    DBUG_RETURN(true);
 
   /*
     Check that the function is called with all specified arguments.
@@ -1873,6 +2050,9 @@ sp_head::execute_procedure(THD *thd, List<Item> *args)
   DBUG_ENTER("sp_head::execute_procedure");
   DBUG_PRINT("info", ("procedure %s", m_name.str));
 
+  if (m_parent && m_parent->instantiate_if_needed(thd))
+    DBUG_RETURN(true);
+
   if (args->elements != params)
   {
     my_error(ER_SP_WRONG_NO_OF_ARGS, MYF(0), "PROCEDURE",
@@ -2094,6 +2274,25 @@ sp_head::execute_procedure(THD *thd, List<Item> *args)
   if (!save_spcont)
     delete octx;
 
+  if (get_package())
+  {
+    /*
+      Dump the package variables to user variables.
+      TODO: this should be eventually changes not to use
+      user variables. Instead, we should preserve "nctx"
+      and link it to the sp_cache entry for the package,
+      so package routines can access it, instead of reading/writing
+      user variables.
+    */
+    sp_pcontext *vcont= m_pcont->child_context(0);
+    for (uint i= 0; i < vcont->context_var_count(); i++)
+    {
+      Item *item= nctx->get_item(i);
+      Item_func_set_user_var *suv= new (thd->mem_root) Item_func_set_user_var(thd, &item->name, item);
+      suv->save_item_result(item);
+      suv->fix_fields(thd, 0) || suv->update();
+    }
+  }
   delete nctx;
   thd->spcont= save_spcont;
   thd->utime_after_lock= utime_before_sp_exec;
@@ -4716,4 +4915,21 @@ sp_head::add_set_for_loop_cursor_param_variables(THD *thd,
       return true;
   }
   return false;
+}
+
+
+bool sp_head::check_package_routine_end_name(const LEX_CSTRING &end_name) const
+{
+  const char *errpos= strchr(m_name.str, '.');
+  if (!errpos)
+  {
+    errpos= m_name.str;
+    goto err;
+  }
+  errpos++;
+  if (!strcmp(end_name.str, errpos))
+    return false;
+err:
+  my_error(ER_END_IDENTIFIER_DOES_NOT_MATCH, MYF(0), end_name.str, errpos);
+  return true;
 }

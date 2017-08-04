@@ -2301,6 +2301,19 @@ public:
     return m_cpp_ptr;
   }
 
+  /**
+    Get the current stream pointer, in the pre-processed buffer,
+    with traling spaces removed.
+  */
+  const char *get_cpp_ptr_rtrim()
+  {
+    const char *p;
+    for (p= m_cpp_ptr;
+         p > m_cpp_buf && my_isspace(system_charset_info, p[-1]);
+         p--)
+    { }
+    return p;
+  }
   /** Get the utf8-body string. */
   const char *get_body_utf8_str()
   {
@@ -3153,26 +3166,41 @@ public:
   bool set_trigger_new_row(LEX_CSTRING *name, Item *val);
   bool set_system_variable(struct sys_var_with_base *tmp,
                            enum enum_var_type var_type, Item *val);
+  bool set_user_variable(THD *thd, const LEX_CSTRING *name, Item *val);
   void set_stmt_init();
-  sp_name *make_sp_name(THD *thd, LEX_CSTRING *name);
-  sp_name *make_sp_name(THD *thd, LEX_CSTRING *name1, LEX_CSTRING *name2);
-  sp_head *make_sp_head(THD *thd, const sp_name *name, const Sp_handler *sph);
-  sp_head *make_sp_head_no_recursive(THD *thd, const sp_name *name,
-                                     const Sp_handler *sph)
-  {
-    if (!sphead)
-      return make_sp_head(thd, name, sph);
-    my_error(ER_SP_NO_RECURSIVE_CREATE, MYF(0), sph->type_str());
-    return NULL;
-  }
+  sp_name *make_sp_name(THD *thd, const LEX_CSTRING *name);
+  sp_name *make_sp_name(THD *thd, const LEX_CSTRING *name1,
+                                  const LEX_CSTRING *name2);
+  sp_head *make_sp_head(THD *thd, sp_package *package,
+                        const sp_name *name,
+                        const Sp_handler *sph);
+  sp_head *make_sp_head_no_recursive(THD *thd, sp_package *package,
+                                     const sp_name *name,
+                                     const Sp_handler *sph);
   sp_head *make_sp_head_no_recursive(THD *thd,
+                                     sp_package *package,
                                      DDL_options_st options, sp_name *name,
                                      const Sp_handler *sph)
   {
     if (add_create_options_with_check(options))
       return NULL;
-    return make_sp_head_no_recursive(thd, name, sph);
+    return make_sp_head_no_recursive(thd, package, name, sph);
   }
+  sp_package *create_package_start(THD *thd,
+                                   enum_sql_command command,
+                                   const Sp_handler *sph,
+                                   const sp_name *name,
+                                   DDL_options_st options);
+  bool create_package_finalize(THD *thd,
+                               const sp_name *name,
+                               const sp_name *name2,
+                               const char *body_start,
+                               const char *body_end);
+  bool call_statement_start(THD *thd, sp_name *name);
+  bool call_statement_start(THD *thd, const LEX_CSTRING *name);
+  bool call_statement_start(THD *thd, const LEX_CSTRING *name1,
+                                      const LEX_CSTRING *name2);
+  sp_variable *find_variable(const LEX_CSTRING *name, sp_pcontext **ctx) const;
   bool init_internal_variable(struct sys_var_with_base *variable,
                              const LEX_CSTRING *name);
   bool init_internal_variable(struct sys_var_with_base *variable,
@@ -3410,6 +3438,7 @@ public:
   bool sp_block_with_exceptions_finalize_exceptions(THD *thd,
                                                   uint executable_section_ip,
                                                   uint exception_count);
+  bool sp_block_with_exceptions_add_empty(THD *thd);
   bool sp_exit_statement(THD *thd, Item *when);
   bool sp_exit_statement(THD *thd, const LEX_CSTRING *label_name, Item *item);
   bool sp_leave_statement(THD *thd, const LEX_CSTRING *label_name);
@@ -3651,6 +3680,10 @@ public:
   bool add_create_view(THD *thd, DDL_options_st ddl,
                        uint16 algorithm, enum_view_suid suid,
                        Table_ident *table_ident);
+
+  bool add_grant_command(THD *thd, enum_sql_command sql_command_arg,
+                         stored_procedure_type type_arg);
+  sp_package *get_sp_package() const;
 };
 
 

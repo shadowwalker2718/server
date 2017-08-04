@@ -1,0 +1,101 @@
+SET sql_mode=ORACLE;
+CREATE PACKAGE pkg1 AS
+PROCEDURE p1;
+FUNCTION f1 RETURN INT;
+PROCEDURE p2show;
+PROCEDURE p2public;
+FUNCTION f2public RETURN TEXT;
+END;
+$$
+CREATE PACKAGE BODY pkg1 AS
+a INT:=10;
+PROCEDURE p1 AS
+b INT:=20;
+BEGIN
+b:=a;
+b:=a+1;
+a:=b;
+a:=b+1;
+a:=a+1;
+SET @a:=@a+2;
+SELECT f1() FROM DUAL;
+END;
+FUNCTION f1 RETURN INT AS
+BEGIN
+RETURN a;
+END;
+PROCEDURE p2private AS
+BEGIN
+SELECT 'This is p2private';
+END;
+PROCEDURE p2public AS
+BEGIN
+SELECT 'This is p2public';
+END;
+FUNCTION f2private RETURN TEXT AS
+BEGIN
+RETURN 'This is f2private';
+END;
+FUNCTION f2public RETURN TEXT AS
+BEGIN
+RETURN 'This is f2public';
+END;
+PROCEDURE p2show AS
+BEGIN
+SHOW FUNCTION CODE f2public;
+SHOW FUNCTION CODE f2private;
+SHOW PROCEDURE CODE p2public;
+SHOW PROCEDURE CODE p2private;
+SHOW PROCEDURE CODE p2show;
+END;
+BEGIN
+a:=a+1;
+DECLARE
+b INT;
+BEGIN
+b:=a;
+b:=a+1;
+a:=b;
+a:=b+1;
+END;
+END;
+$$
+SHOW PROCEDURE CODE pkg1.p1;
+Pos	Instruction
+0	set b@0 20
+1	set b@0 @"a"
+2	set b@0 @"a" + 1
+3	stmt 31 "SET b"
+4	stmt 31 "SET b+1"
+5	stmt 31 "SET a+1"
+6	stmt 31 "SET @a:=@a+2"
+7	stmt 0 "SELECT f1() FROM DUAL"
+SHOW FUNCTION CODE pkg1.f1;
+Pos	Instruction
+0	freturn int @"a"
+SHOW PACKAGE BODY CODE pkg1;
+Pos	Instruction
+0	set a@0 10
+1	set a@0 a@0 + 1
+2	set b@1 NULL
+3	set b@1 a@0
+4	set b@1 a@0 + 1
+5	set a@0 b@1
+6	set a@0 b@1 + 1
+7	jump 11
+CALL pkg1.p2show;
+Pos	Instruction
+0	freturn blob 'This is f2public'
+Pos	Instruction
+0	freturn blob 'This is f2private'
+Pos	Instruction
+0	stmt 0 "SELECT 'This is p2public'"
+Pos	Instruction
+0	stmt 0 "SELECT 'This is p2private'"
+Pos	Instruction
+0	stmt 110 "SHOW FUNCTION CODE f2public"
+1	stmt 110 "SHOW FUNCTION CODE f2private"
+2	stmt 109 "SHOW PROCEDURE CODE p2public"
+3	stmt 109 "SHOW PROCEDURE CODE p2private"
+4	stmt 109 "SHOW PROCEDURE CODE p2show"
+DROP PACKAGE pkg1;

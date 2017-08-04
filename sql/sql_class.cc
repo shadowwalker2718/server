@@ -903,6 +903,8 @@ THD::THD(my_thread_id id, bool is_wsrep_applier)
 
   sp_proc_cache= NULL;
   sp_func_cache= NULL;
+  sp_package_spec_cache= NULL;
+  sp_package_body_cache= NULL;
 
   /* For user vars replication*/
   if (opt_bin_log)
@@ -1465,6 +1467,8 @@ void THD::change_user(void)
                (my_hash_free_key) free_sequence_last, HASH_THREAD_SPECIFIC);
   sp_cache_clear(&sp_proc_cache);
   sp_cache_clear(&sp_func_cache);
+  sp_cache_clear(&sp_package_spec_cache);
+  sp_cache_clear(&sp_package_body_cache);
 }
 
 
@@ -1522,6 +1526,8 @@ void THD::cleanup(void)
   my_hash_free(&sequences);
   sp_cache_clear(&sp_proc_cache);
   sp_cache_clear(&sp_func_cache);
+  sp_cache_clear(&sp_package_spec_cache);
+  sp_cache_clear(&sp_package_body_cache);
   auto_inc_intervals_forced.empty();
   auto_inc_intervals_in_cur_stmt_for_binlog.empty();
 
@@ -7502,6 +7508,16 @@ void AUTHID::parse(const char *str, size_t length)
     user.length= USERNAME_LENGTH;
   if (host.length > HOSTNAME_LENGTH)
     host.length= HOSTNAME_LENGTH;
+}
+
+
+void Database_qualified_name::copy(MEM_ROOT *mem_root,
+                                   const Database_qualified_name &name)
+{
+  m_db.length= name.m_db.length;
+  m_db.str= strmake_root(mem_root, name.m_db.str, name.m_db.length);
+  m_name.length= name.m_name.length;
+  m_name.str= strmake_root(mem_root, name.m_name.str, name.m_name.length);
 }
 
 

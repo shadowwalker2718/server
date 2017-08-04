@@ -237,6 +237,7 @@ void ORAerror(THD *thd, const char *s)
   st_trg_execution_order trg_execution_order;
 
   /* enums */
+  enum enum_sp_suid_behaviour sp_suid;
   enum enum_view_suid view_suid;
   enum sub_select_type unit_type;
   enum Condition_information_item::Name cond_info_item_name;
@@ -341,6 +342,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  BIT_XOR                       /* MYSQL-FUNC */
 %token  BLOB_SYM                      /* SQL-2003-R */
 %token  BLOCK_SYM
+%token  BODY_SYM                      /* Oracle-R   */
 %token  BOOLEAN_SYM                   /* SQL-2003-R */
 %token  BOOL_SYM
 %token  BOTH                          /* SQL-2003-R */
@@ -723,6 +725,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  OUT_SYM                       /* SQL-2003-R */
 %token  OVER_SYM
 %token  OWNER_SYM
+%token  PACKAGE_SYM                   /* Oracle-R */
 %token  PACK_KEYS_SYM
 %token  PAGE_SYM
 %token  PAGE_CHECKSUM_SYM
@@ -1048,7 +1051,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         optionally_qualified_column_ident
 
 %type <simple_string>
-        remember_name remember_end remember_tok_start
+        remember_name remember_end remember_end_opt remember_tok_start
         wild_and_where
         colon_with_pos
 
@@ -1309,7 +1312,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         opt_extended_describe shutdown
         opt_format_json
         prepare prepare_src execute deallocate
-        statement sp_suid
+        statement
         sp_c_chistics sp_a_chistics sp_chistic sp_c_chistic xa
         opt_field_or_var_spec fields_or_vars opt_load_data_set_spec
         view_list_opt view_list view_select
@@ -1329,8 +1332,8 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         opt_serial_attribute opt_serial_attribute_list serial_attribute
         explainable_command
         set_assign
-        sf_tail_standalone
-        sp_tail_standalone
+        sf_tail_standalone sf_tail_package
+        sp_tail_standalone sp_tail_package
 END_OF_INPUT
 
 %type <NONE> call sp_proc_stmts sp_proc_stmts1 sp_proc_stmt
@@ -1351,6 +1354,7 @@ END_OF_INPUT
 
 %type <num> view_algorithm view_check_option
 %type <view_suid> view_suid opt_view_suid
+%type <sp_suid> sp_suid
 
 %type <num> sp_decl_idents sp_decl_idents_init_vars
 %type <num> sp_handler_type sp_hcond_list
@@ -1358,10 +1362,17 @@ END_OF_INPUT
 %type <spblock> sp_decl_body_list opt_sp_decl_body_list
 %type <spblock> sp_decl_non_handler sp_decl_non_handler_list
 %type <spblock> sp_decl_handler sp_decl_handler_list opt_sp_decl_handler_list
+%type <spblock> package_implementation_routine_definition
+%type <spblock> package_implementation_item_declaration
+%type <spblock> package_implementation_declare_section
+%type <spblock> package_implementation_declare_section_list1
+%type <spblock> package_implementation_declare_section_list2
 %type <spblock_handlers> sp_block_statements_and_exceptions
+%type <spblock_handlers> package_implementation_executable_section
 %type <sp_instr_addr> sp_instr_addr
 %type <sp_cursor_name_and_offset> sp_cursor_name_and_offset
 %type <num> opt_exception_clause exception_handlers
+%type <lex> remember_lex package_routine_lex
 %type <spname> sp_name opt_sp_name
 %type <spvar> sp_param_name sp_param_name_and_type
 %type <for_loop> sp_for_loop_index_and_bounds
@@ -2090,6 +2101,217 @@ create:
         | create_or_replace { Lex->set_command(SQLCOM_CREATE_SERVER, $1); }
           server_def
           { }
+        | create_or_replace definer_opt PACKAGE_SYM
+          opt_if_not_exists sp_name opt_create_package_chistics_init
+          sp_tail_is
+          remember_name
+          {
+            sp_package *pkg;
+            if (!(pkg= Lex->create_package_start(thd,
+                                                 SQLCOM_CREATE_PACKAGE,
+                                                 &sp_handler_package_spec,
+                                                 $5, $1 | $4)))
+              MYSQL_YYABORT;
+            pkg->set_chistics(Lex->sp_chistics);
+          }
+          opt_package_specification_element_list END
+          remember_end_opt opt_sp_name
+          {
+            if (Lex->create_package_finalize(thd, $5, $13, $8, $12))
+              MYSQL_YYABORT;
+          }
+        | create_or_replace definer_opt PACKAGE_SYM BODY_SYM
+          opt_if_not_exists sp_name opt_create_package_chistics_init
+          sp_tail_is
+          remember_name
+          {
+            sp_package *pkg;
+            if (!(pkg= Lex->create_package_start(thd,
+                                                 SQLCOM_CREATE_PACKAGE_BODY,
+                                                 &sp_handler_package_body,
+                                                 $6, $1 | $5)))
+              MYSQL_YYABORT;
+            pkg->set_chistics(Lex->sp_chistics);
+            Lex->sp_block_init(thd);
+          }
+          package_implementation_declare_section
+          {
+            if (Lex->sp_block_with_exceptions_finalize_declarations(thd))
+              MYSQL_YYABORT;
+          }
+          package_implementation_executable_section
+          {
+            $11.hndlrs+= $13.hndlrs;
+            if (Lex->sp_block_finalize(thd, $11))
+              MYSQL_YYABORT;
+          }
+          remember_end_opt opt_sp_name
+          {
+            if (Lex->create_package_finalize(thd, $6, $16, $9, $15))
+              MYSQL_YYABORT;
+          }
+        ;
+
+package_implementation_executable_section:
+          END
+          {
+            if (Lex->sp_block_with_exceptions_add_empty(thd))
+              MYSQL_YYABORT;
+            $$.init(0);
+          }
+        | BEGIN_SYM sp_block_statements_and_exceptions END { $$= $2; }
+        ;
+
+/*
+  Inside CREATE PACKATE BODY, package-wide items (e.g. variables)
+  must be declared before routine definitions.
+*/
+package_implementation_declare_section:
+          package_implementation_declare_section_list1
+        | package_implementation_declare_section_list2
+        | package_implementation_declare_section_list1
+          package_implementation_declare_section_list2
+          { $$.join($1, $2); }
+        ;
+
+package_implementation_declare_section_list1:
+          package_implementation_item_declaration
+        | package_implementation_declare_section_list1
+          package_implementation_item_declaration
+          { $$.join($1, $2); }
+        ;
+
+package_implementation_declare_section_list2:
+          package_implementation_routine_definition
+        | package_implementation_declare_section_list2
+          package_implementation_routine_definition
+          { $$.join($1, $2); }
+        ;
+
+package_routine_lex:
+          {
+            if (!($$= new (thd->mem_root) sp_lex_local(thd, thd->lex)))
+              MYSQL_YYABORT;
+            thd->m_parser_state->m_yacc.reset_before_substatement();
+          }
+        ;
+
+package_implementation_routine_definition:
+          FUNCTION_SYM remember_lex package_routine_lex
+          {
+            LEX *oldlex= $2;
+            thd->lex= $3;
+            if (oldlex->sphead->add_routine_implementation(thd, $3))
+              MYSQL_YYABORT;
+          }
+          sf_tail_package ';'
+          {
+            DBUG_ASSERT($2->sphead->get_package());
+            thd->lex= $2;
+            $$.init();
+          }
+        | PROCEDURE_SYM remember_lex package_routine_lex
+          {
+            LEX *oldlex= $2;
+            thd->lex= $3;
+            if (oldlex->sphead->add_routine_implementation(thd, $3))
+              MYSQL_YYABORT;
+          }
+          sp_tail_package ';'
+          {
+            DBUG_ASSERT($2->sphead->get_package());
+            thd->lex= $2;
+            $$.init();
+          }
+        ;
+
+package_implementation_item_declaration:
+          IDENT_sys
+          {
+            // TODO: add keyword_directly_assignable ???
+            LEX *lex= Lex;
+            sp_pcontext *spc= lex->spcont;
+            if (spc->find_variable(&$1, true))
+              my_yyabort_error((ER_SP_DUP_VAR, MYF(0), $1.str));
+            spc->add_variable(thd, &$1);
+            lex->sp_variable_declarations_init(thd, 1);
+          }
+          type_with_opt_collate sp_opt_default ';'
+          {
+            if (Lex->sp_variable_declarations_finalize(thd, 1,
+                                                       &Lex->last_field[0], $4))
+              MYSQL_YYABORT;
+            $$.init_using_vars(1);
+          }
+        ;
+
+opt_package_specification_element_list:
+          /* Empty */
+        | package_specification_element_list
+        ;
+
+package_specification_element_list:
+          package_specification_element
+        | package_specification_element_list package_specification_element
+        ;
+
+package_specification_element:
+          FUNCTION_SYM package_specification_function ';'
+        | PROCEDURE_SYM package_specification_procedure ';'
+        ;
+
+package_specification_function:
+          remember_lex package_routine_lex sp_name
+          {
+            LEX *oldlex= $1;
+            thd->lex= $2;
+            if (oldlex->sphead->add_routine_declaration(thd, $2))
+              MYSQL_YYABORT;
+            if (!Lex->make_sp_head_no_recursive(thd,
+                                                oldlex->get_sp_package(),
+                                                DDL_options(), $3,
+                                                &sp_handler_function))
+              MYSQL_YYABORT;
+            (void) is_native_function_with_warn(thd, &$3->m_name);
+            Lex->sql_command= SQLCOM_CREATE_FUNCTION;
+          }
+          opt_sp_parenthesized_fdparam_list
+          sf_return_type
+          sp_c_chistics
+          {
+            sp_head *sp= thd->lex->sphead;
+            sp->set_body_start(thd, YYLIP->get_cpp_tok_start());
+            sp->set_stmt_end(thd);
+            sp->restore_thd_mem_root(thd);
+            DBUG_ASSERT($1->sphead->get_package());
+            thd->lex= $1;
+          }
+        ;
+
+package_specification_procedure:
+          remember_lex package_routine_lex sp_name
+          {
+            LEX *oldlex= $1;
+            thd->lex= $2;
+            if (oldlex->sphead->add_routine_declaration(thd, $2))
+              MYSQL_YYABORT;
+            if (!Lex->make_sp_head_no_recursive(thd,
+                                                oldlex->get_sp_package(),
+                                                DDL_options(), $3,
+                                                &sp_handler_procedure))
+              MYSQL_YYABORT;
+            Lex->sql_command= SQLCOM_CREATE_PROCEDURE;
+          }
+          opt_sp_parenthesized_pdparam_list
+          sp_c_chistics
+          {
+            sp_head *sp= thd->lex->sphead;
+            sp->set_body_start(thd, YYLIP->get_cpp_tok_start());
+            sp->set_stmt_end(thd);
+            sp->restore_thd_mem_root(thd);
+            DBUG_ASSERT($1->sphead->get_package());
+            thd->lex= $1;
+          }
         ;
 
 create_function_tail:
@@ -2387,8 +2609,9 @@ ev_sql_stmt:
             if (lex->sphead)
               my_yyabort_error((ER_EVENT_RECURSION_FORBIDDEN, MYF(0)));
               
-            if (!lex->make_sp_head(thd, lex->event_parse_data->identifier,
-                                        &sp_handler_procedure))
+            if (!lex->make_sp_head(thd, NULL,
+                                   lex->event_parse_data->identifier,
+                                   &sp_handler_procedure))
               MYSQL_YYABORT;
 
             lex->sphead->set_body_start(thd, lip->get_cpp_ptr());
@@ -2463,7 +2686,29 @@ sp_chistic:
         | MODIFIES_SYM SQL_SYM DATA_SYM
           { Lex->sp_chistics.daccess= SP_MODIFIES_SQL_DATA; }
         | sp_suid
-          {}
+          { Lex->sp_chistics.suid= $1; }
+        ;
+
+create_package_chistic:
+          COMMENT_SYM TEXT_STRING_sys
+          { Lex->sp_chistics.comment= $2; }
+        | sp_suid
+          { Lex->sp_chistics.suid= $1; }
+        ;
+
+create_package_chistics:
+          create_package_chistic {}
+        | create_package_chistics create_package_chistic { }
+        ;
+
+opt_create_package_chistics:
+          /* Empty */
+        | create_package_chistics { }
+        ;
+
+opt_create_package_chistics_init:
+          { Lex->sp_chistics.init(); }
+          opt_create_package_chistics
         ;
 
 /* Create characteristics */
@@ -2473,25 +2718,15 @@ sp_c_chistic:
         ;
 
 sp_suid:
-          SQL_SYM SECURITY_SYM DEFINER_SYM
-          {
-            Lex->sp_chistics.suid= SP_IS_SUID;
-          }
-        | SQL_SYM SECURITY_SYM INVOKER_SYM
-          {
-            Lex->sp_chistics.suid= SP_IS_NOT_SUID;
-          }
+          SQL_SYM SECURITY_SYM DEFINER_SYM { $$= SP_IS_SUID; }
+        | SQL_SYM SECURITY_SYM INVOKER_SYM { $$= SP_IS_NOT_SUID; }
         ;
 
 call:
           CALL_SYM sp_name
           {
-            LEX *lex = Lex;
-
-            lex->sql_command= SQLCOM_CALL;
-            lex->spname= $2;
-            lex->value_list.empty();
-            sp_handler_procedure.add_used_routine(lex, thd, $2);
+            if (Lex->call_statement_start(thd, $2))
+              MYSQL_YYABORT;
           }
           opt_sp_cparam_list {}
         ;
@@ -3374,22 +3609,14 @@ sp_statement:
         | ident_directly_assignable
           {
             // Direct procedure call (without the CALL keyword)
-            LEX *lex = Lex;
-            if (!(lex->spname= lex->make_sp_name(thd, &$1)))
+            if (Lex->call_statement_start(thd, &$1))
               MYSQL_YYABORT;
-            lex->sql_command= SQLCOM_CALL;
-            lex->value_list.empty();
-            sp_handler_procedure.add_used_routine(lex, thd, lex->spname);
           }
           opt_sp_cparam_list
         | ident_directly_assignable '.' ident
           {
-            LEX *lex = Lex;
-            if (!(lex->spname= lex->make_sp_name(thd, &$1, &$3)))
+            if (Lex->call_statement_start(thd, &$1, &$3))
               MYSQL_YYABORT;
-            lex->sql_command= SQLCOM_CALL;
-            lex->value_list.empty();
-            sp_handler_procedure.add_used_routine(lex, thd, lex->spname);
           }
           opt_sp_cparam_list
         ;
@@ -3546,6 +3773,12 @@ sp_proc_stmt_goto:
           }
         ;
 
+
+remember_lex:
+          {
+            $$= thd->lex;
+          }
+        ;
 
 assignment_source_lex:
           {
@@ -8805,6 +9038,15 @@ remember_end:
           }
         ;
 
+remember_end_opt:
+          {
+            if (yychar == YYEMPTY)
+              $$= (char*) YYLIP->get_cpp_ptr_rtrim();
+            else
+              $$= (char*) YYLIP->get_cpp_tok_end_rtrim();
+          }
+        ;
+
 select_alias:
           /* empty */ { $$=null_clex_str;}
         | AS ident { $$=$2; }
@@ -12327,6 +12569,22 @@ drop:
             lex->set_command(SQLCOM_DROP_DB, $3);
             lex->name= $4;
           }
+        | DROP PACKAGE_SYM opt_if_exists sp_name
+          {
+            LEX *lex= Lex;
+            lex->set_command(SQLCOM_DROP_PACKAGE, $3);
+            if (lex->sphead)
+              my_yyabort_error((ER_SP_NO_DROP_SP, MYF(0), "PACKAGE"));
+            lex->spname= $4;
+          }
+        | DROP PACKAGE_SYM BODY_SYM opt_if_exists sp_name
+          {
+            LEX *lex= Lex;
+            lex->set_command(SQLCOM_DROP_PACKAGE_BODY, $4);
+            if (lex->sphead)
+              my_yyabort_error((ER_SP_NO_DROP_SP, MYF(0), "PACKAGE BODY"));
+            lex->spname= $5;
+          }
         | DROP FUNCTION_SYM opt_if_exists ident '.' ident
           {
             LEX *lex= thd->lex;
@@ -13244,6 +13502,18 @@ show_param:
             lex->sql_command = SQLCOM_SHOW_CREATE_FUNC;
             lex->spname= $3;
           }
+        | CREATE PACKAGE_SYM sp_name
+          {
+            LEX *lex= Lex;
+            lex->sql_command = SQLCOM_SHOW_CREATE_PACKAGE;
+            lex->spname= $3;
+          }
+        | CREATE PACKAGE_SYM BODY_SYM sp_name
+          {
+            LEX *lex= Lex;
+            lex->sql_command = SQLCOM_SHOW_CREATE_PACKAGE_BODY;
+            lex->spname= $4;
+          }
         | CREATE TRIGGER_SYM sp_name
           {
             LEX *lex= Lex;
@@ -13276,6 +13546,20 @@ show_param:
             if (prepare_schema_table(thd, lex, 0, SCH_PROCEDURES))
               MYSQL_YYABORT;
           }
+        | PACKAGE_SYM STATUS_SYM wild_and_where
+          {
+            LEX *lex= Lex;
+            lex->sql_command= SQLCOM_SHOW_STATUS_PACKAGE;
+            if (prepare_schema_table(thd, lex, 0, SCH_PROCEDURES))
+              MYSQL_YYABORT;
+          }
+        | PACKAGE_SYM BODY_SYM STATUS_SYM wild_and_where
+          {
+            LEX *lex= Lex;
+            lex->sql_command= SQLCOM_SHOW_STATUS_PACKAGE_BODY;
+            if (prepare_schema_table(thd, lex, 0, SCH_PROCEDURES))
+              MYSQL_YYABORT;
+          }
         | PROCEDURE_SYM CODE_SYM sp_name
           {
             Lex->sql_command= SQLCOM_SHOW_PROC_CODE;
@@ -13285,6 +13569,11 @@ show_param:
           {
             Lex->sql_command= SQLCOM_SHOW_FUNC_CODE;
             Lex->spname= $3;
+          }
+        | PACKAGE_SYM BODY_SYM CODE_SYM sp_name
+          {
+            Lex->sql_command= SQLCOM_SHOW_PACKAGE_BODY_CODE;
+            Lex->spname= $4;
           }
         | CREATE EVENT_SYM sp_name
           {
@@ -15385,14 +15674,8 @@ option_value_no_option_type:
           }
         | '@' ident_or_text equal expr
           {
-            Item_func_set_user_var *item;
-            item= new (thd->mem_root) Item_func_set_user_var(thd, &$2, $4);
-            if (item == NULL)
+            if (Lex->set_user_variable(thd, &$2, $4))
               MYSQL_YYABORT;
-            set_var_user *var= new (thd->mem_root) set_var_user(item);
-            if (var == NULL)
-              MYSQL_YYABORT;
-            Lex->var_list.push_back(var, thd->mem_root);
           }
         | '@' '@' opt_var_ident_type internal_variable_name equal set_expr_or_default
           {
@@ -15821,25 +16104,25 @@ revoke_command:
           }
         | grant_privileges ON FUNCTION_SYM grant_ident FROM user_and_role_list
           {
-            LEX *lex= Lex;
-            if (lex->columns.elements)
-            {
-              thd->parse_error();
+            if (Lex->add_grant_command(thd, SQLCOM_REVOKE, TYPE_ENUM_FUNCTION))
               MYSQL_YYABORT;
-            }
-            lex->sql_command= SQLCOM_REVOKE;
-            lex->type= TYPE_ENUM_FUNCTION;
           }
         | grant_privileges ON PROCEDURE_SYM grant_ident FROM user_and_role_list
           {
-            LEX *lex= Lex;
-            if (lex->columns.elements)
-            {
-              thd->parse_error();
+            if (Lex->add_grant_command(thd, SQLCOM_REVOKE, TYPE_ENUM_PROCEDURE))
               MYSQL_YYABORT;
-            }
-            lex->sql_command= SQLCOM_REVOKE;
-            lex->type= TYPE_ENUM_PROCEDURE;
+          }
+        | grant_privileges ON PACKAGE_SYM grant_ident FROM user_and_role_list
+          {
+            if (Lex->add_grant_command(thd, SQLCOM_REVOKE,
+                                            TYPE_ENUM_PACKAGE))
+              MYSQL_YYABORT;
+          }
+        | grant_privileges ON PACKAGE_SYM BODY_SYM grant_ident FROM user_and_role_list
+          {
+            if (Lex->add_grant_command(thd, SQLCOM_REVOKE,
+                                            TYPE_ENUM_PACKAGE_BODY))
+              MYSQL_YYABORT;
           }
         | ALL opt_privileges ',' GRANT OPTION FROM user_and_role_list
           {
@@ -15883,26 +16166,28 @@ grant_command:
         | grant_privileges ON FUNCTION_SYM grant_ident TO_SYM grant_list
           opt_require_clause opt_grant_options
           {
-            LEX *lex= Lex;
-            if (lex->columns.elements)
-            {
-              thd->parse_error();
+            if (Lex->add_grant_command(thd, SQLCOM_GRANT, TYPE_ENUM_FUNCTION))
               MYSQL_YYABORT;
-            }
-            lex->sql_command= SQLCOM_GRANT;
-            lex->type= TYPE_ENUM_FUNCTION;
           }
         | grant_privileges ON PROCEDURE_SYM grant_ident TO_SYM grant_list
           opt_require_clause opt_grant_options
           {
-            LEX *lex= Lex;
-            if (lex->columns.elements)
-            {
-              thd->parse_error();
+            if (Lex->add_grant_command(thd, SQLCOM_GRANT, TYPE_ENUM_PROCEDURE))
               MYSQL_YYABORT;
-            }
-            lex->sql_command= SQLCOM_GRANT;
-            lex->type= TYPE_ENUM_PROCEDURE;
+          }
+        | grant_privileges ON PACKAGE_SYM grant_ident TO_SYM grant_list
+          opt_require_clause opt_grant_options
+          {
+            if (Lex->add_grant_command(thd, SQLCOM_GRANT,
+                                            TYPE_ENUM_PACKAGE))
+              MYSQL_YYABORT;
+          }
+        | grant_privileges ON PACKAGE_SYM BODY_SYM grant_ident TO_SYM grant_list
+          opt_require_clause opt_grant_options
+          {
+            if (Lex->add_grant_command(thd, SQLCOM_GRANT,
+                                            TYPE_ENUM_PACKAGE_BODY))
+              MYSQL_YYABORT;
           }
         | PROXY_SYM ON user TO_SYM grant_list opt_grant_option
           {
@@ -16805,7 +17090,7 @@ trigger_tail:
             (*static_cast<st_trg_execution_order*>(&lex->trg_chistics))= ($17);
             lex->trg_chistics.ordering_clause_end= lip->get_cpp_ptr();
 
-            if (!lex->make_sp_head(thd, $4, &sp_handler_trigger))
+            if (!lex->make_sp_head(thd, NULL, $4, &sp_handler_trigger))
               MYSQL_YYABORT;
 
             lex->sphead->set_body_start(thd, lip->get_cpp_tok_start());
@@ -16880,7 +17165,8 @@ sf_tail:
           opt_if_not_exists
           sp_name
           {
-            if (!Lex->make_sp_head_no_recursive(thd, $1, $2,
+            if (!Lex->make_sp_head_no_recursive(thd, Lex->get_sp_package(),
+                                                $1, $2,
                                                 &sp_handler_function))
               MYSQL_YYABORT;
           }
@@ -16918,7 +17204,8 @@ sf_tail:
 sp_tail:
           opt_if_not_exists sp_name
           {
-            if (!Lex->make_sp_head_no_recursive(thd, $1, $2,
+            if (!Lex->make_sp_head_no_recursive(thd, Lex->get_sp_package(),
+                                                $1, $2,
                                                 &sp_handler_procedure))
               MYSQL_YYABORT;
           }
@@ -16958,6 +17245,24 @@ sp_tail_standalone:
               my_yyabort_error((ER_END_IDENTIFIER_DOES_NOT_MATCH, MYF(0),
                                 ErrConvDQName($2).ptr(),
                                 ErrConvDQName(Lex->sphead).ptr()));
+          }
+        ;
+
+sf_tail_package:
+          sf_tail
+        | sf_tail ident
+          {
+            if (Lex->sphead->check_package_routine_end_name($2))
+              MYSQL_YYABORT;
+          }
+        ;
+
+sp_tail_package:
+          sp_tail
+        | sp_tail ident
+          {
+            if (Lex->sphead->check_package_routine_end_name($2))
+              MYSQL_YYABORT;
           }
         ;
 

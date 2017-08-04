@@ -124,14 +124,6 @@ static void wsrep_mysql_parse(THD *thd, char *rawbuf, uint length,
   @{
 */
 
-/* Used in error handling only */
-#define SP_COM_STRING(LP) \
-  ((LP)->sql_command == SQLCOM_CREATE_SPFUNCTION || \
-   (LP)->sql_command == SQLCOM_ALTER_FUNCTION || \
-   (LP)->sql_command == SQLCOM_SHOW_CREATE_FUNC || \
-   (LP)->sql_command == SQLCOM_DROP_FUNCTION ? \
-   "FUNCTION" : "PROCEDURE")
-
 static bool execute_sqlcom_select(THD *thd, TABLE_LIST *all_tables);
 static void sql_kill(THD *thd, longlong id, killed_state state, killed_type type);
 static void sql_kill_user(THD *thd, LEX_USER *user, killed_state state);
@@ -567,6 +559,10 @@ void init_update_queries(void)
                                             CF_INSERTS_DATA;
   sql_command_flags[SQLCOM_CREATE_DB]=      CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS | CF_DB_CHANGE;
   sql_command_flags[SQLCOM_DROP_DB]=        CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS | CF_DB_CHANGE;
+  sql_command_flags[SQLCOM_CREATE_PACKAGE]= CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
+  sql_command_flags[SQLCOM_DROP_PACKAGE]=   CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
+  sql_command_flags[SQLCOM_CREATE_PACKAGE_BODY]= CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
+  sql_command_flags[SQLCOM_DROP_PACKAGE_BODY]= CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
   sql_command_flags[SQLCOM_ALTER_DB_UPGRADE]= CF_AUTO_COMMIT_TRANS;
   sql_command_flags[SQLCOM_ALTER_DB]=       CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
   sql_command_flags[SQLCOM_RENAME_TABLE]=   CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
@@ -640,6 +636,8 @@ void init_update_queries(void)
                                             CF_OPTIMIZER_TRACE; // (1)
 
   sql_command_flags[SQLCOM_SHOW_STATUS_PROC]= CF_STATUS_COMMAND | CF_REEXECUTION_FRAGILE;
+  sql_command_flags[SQLCOM_SHOW_STATUS_PACKAGE]= CF_STATUS_COMMAND | CF_REEXECUTION_FRAGILE;
+  sql_command_flags[SQLCOM_SHOW_STATUS_PACKAGE_BODY]= CF_STATUS_COMMAND | CF_REEXECUTION_FRAGILE;
   sql_command_flags[SQLCOM_SHOW_STATUS]=      CF_STATUS_COMMAND | CF_REEXECUTION_FRAGILE;
   sql_command_flags[SQLCOM_SHOW_DATABASES]=   CF_STATUS_COMMAND | CF_REEXECUTION_FRAGILE;
   sql_command_flags[SQLCOM_SHOW_TRIGGERS]=    CF_STATUS_COMMAND | CF_REEXECUTION_FRAGILE;
@@ -674,10 +672,13 @@ void init_update_queries(void)
   sql_command_flags[SQLCOM_SHOW_SLAVE_STAT]=  CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_CREATE_PROC]= CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_CREATE_FUNC]= CF_STATUS_COMMAND;
+  sql_command_flags[SQLCOM_SHOW_CREATE_PACKAGE]= CF_STATUS_COMMAND;
+  sql_command_flags[SQLCOM_SHOW_CREATE_PACKAGE_BODY]= CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_CREATE_TRIGGER]=  CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_STATUS_FUNC]= CF_STATUS_COMMAND | CF_REEXECUTION_FRAGILE;
   sql_command_flags[SQLCOM_SHOW_PROC_CODE]=   CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_FUNC_CODE]=   CF_STATUS_COMMAND;
+  sql_command_flags[SQLCOM_SHOW_PACKAGE_BODY_CODE]= CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_CREATE_EVENT]= CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_PROFILES]=    CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_PROFILE]=     CF_STATUS_COMMAND;
@@ -838,6 +839,10 @@ void init_update_queries(void)
   sql_command_flags[SQLCOM_DROP_INDEX]|=       CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_CREATE_DB]|=        CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_DROP_DB]|=          CF_DISALLOW_IN_RO_TRANS;
+  sql_command_flags[SQLCOM_CREATE_PACKAGE]|=   CF_DISALLOW_IN_RO_TRANS;
+  sql_command_flags[SQLCOM_DROP_PACKAGE]|=     CF_DISALLOW_IN_RO_TRANS;
+  sql_command_flags[SQLCOM_CREATE_PACKAGE_BODY]|= CF_DISALLOW_IN_RO_TRANS;
+  sql_command_flags[SQLCOM_DROP_PACKAGE_BODY]|= CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_ALTER_DB_UPGRADE]|= CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_ALTER_DB]|=         CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_CREATE_VIEW]|=      CF_DISALLOW_IN_RO_TRANS;
@@ -3596,6 +3601,8 @@ mysql_execute_command(THD *thd)
     /* fall through */
   case SQLCOM_SHOW_STATUS_PROC:
   case SQLCOM_SHOW_STATUS_FUNC:
+  case SQLCOM_SHOW_STATUS_PACKAGE:
+  case SQLCOM_SHOW_STATUS_PACKAGE_BODY:
   case SQLCOM_SHOW_DATABASES:
   case SQLCOM_SHOW_TABLES:
   case SQLCOM_SHOW_TRIGGERS:
@@ -5350,11 +5357,10 @@ end_with_restore_list:
     }
     if (first_table)
     {
-      if (lex->type == TYPE_ENUM_PROCEDURE ||
-          lex->type == TYPE_ENUM_FUNCTION)
+      const Sp_handler *sph= Sp_handler::handler((stored_procedure_type)
+                                                 lex->type);
+      if (sph)
       {
-        const Sp_handler *sph= Sp_handler::handler((stored_procedure_type)
-                                                   lex->type);
         uint grants= lex->all_privileges 
 		   ? (PROC_ACLS & ~GRANT_ACL) | (lex->grant & GRANT_ACL)
 		   : lex->grant;
@@ -5749,6 +5755,8 @@ end_with_restore_list:
     break;
   case SQLCOM_CREATE_PROCEDURE:
   case SQLCOM_CREATE_SPFUNCTION:
+  case SQLCOM_CREATE_PACKAGE:
+  case SQLCOM_CREATE_PACKAGE_BODY:
   {
     if (mysql_create_routine(thd, lex))
       goto error;
@@ -5767,17 +5775,21 @@ end_with_restore_list:
           open_and_lock_tables(thd, all_tables, TRUE, 0))
        goto error;
 
-      if (check_routine_access(thd, EXECUTE_ACL, lex->spname->m_db.str,
-                               lex->spname->m_name.str, &sp_handler_procedure,
-                               false))
-        goto error;
-
       /*
         By this moment all needed SPs should be in cache so no need to look 
         into DB. 
       */
       if (!(sp= sp_handler_procedure.sp_find_routine(thd, lex->spname, true)))
       {
+        /*
+          If the routine is not found, let's still check EXECUTE_ACL to decide
+          whether to return "Access denied" or "Routine does not exist".
+        */
+        if (check_routine_access(thd, EXECUTE_ACL, lex->spname->m_db.str,
+                                 lex->spname->m_name.str,
+                                 &sp_handler_procedure,
+                                 false))
+          goto error;
         /*
           sp_find_routine can have issued an ER_SP_RECURSION_LIMIT error.
           Send message ER_SP_DOES_NOT_EXIST only if procedure is not found in
@@ -5790,6 +5802,8 @@ end_with_restore_list:
       }
       else
       {
+        if (sp->check_execute_access(thd))
+          goto error;
         /*
           Check that the stored procedure doesn't contain Dynamic SQL
           and doesn't return result sets: such stored procedures can't
@@ -5841,17 +5855,19 @@ end_with_restore_list:
 	break;
       case SP_KEY_NOT_FOUND:
 	my_error(ER_SP_DOES_NOT_EXIST, MYF(0),
-                 SP_COM_STRING(lex), ErrConvDQName(lex->spname).ptr());
+                 sph->type_str(), ErrConvDQName(lex->spname).ptr());
 	goto error;
       default:
 	my_error(ER_SP_CANT_ALTER, MYF(0),
-                 SP_COM_STRING(lex), ErrConvDQName(lex->spname).ptr());
+                 sph->type_str(), ErrConvDQName(lex->spname).ptr());
 	goto error;
       }
       break;
     }
   case SQLCOM_DROP_PROCEDURE:
   case SQLCOM_DROP_FUNCTION:
+  case SQLCOM_DROP_PACKAGE:
+  case SQLCOM_DROP_PACKAGE_BODY:
     {
 #ifdef HAVE_DLOPEN
       if (lex->sql_command == SQLCOM_DROP_FUNCTION &&
@@ -5950,24 +5966,26 @@ end_with_restore_list:
           res= write_bin_log(thd, TRUE, thd->query(), thd->query_length());
 	  push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
 			      ER_SP_DOES_NOT_EXIST, ER_THD(thd, ER_SP_DOES_NOT_EXIST),
-                              SP_COM_STRING(lex),
+                              sph->type_str(),
                               ErrConvDQName(lex->spname).ptr());
           if (!res)
             my_ok(thd);
 	  break;
 	}
 	my_error(ER_SP_DOES_NOT_EXIST, MYF(0),
-                 SP_COM_STRING(lex), ErrConvDQName(lex->spname).ptr());
+                 sph->type_str(), ErrConvDQName(lex->spname).ptr());
 	goto error;
       default:
 	my_error(ER_SP_DROP_FAILED, MYF(0),
-                 SP_COM_STRING(lex), ErrConvDQName(lex->spname).ptr());
+                 sph->type_str(), ErrConvDQName(lex->spname).ptr());
 	goto error;
       }
       break;
     }
   case SQLCOM_SHOW_CREATE_PROC:
   case SQLCOM_SHOW_CREATE_FUNC:
+  case SQLCOM_SHOW_CREATE_PACKAGE:
+  case SQLCOM_SHOW_CREATE_PACKAGE_BODY:
     {
       const Sp_handler *sph= Sp_handler::handler(lex->sql_command);
 #ifdef WITH_WSREP
@@ -5979,20 +5997,25 @@ end_with_restore_list:
     }
   case SQLCOM_SHOW_PROC_CODE:
   case SQLCOM_SHOW_FUNC_CODE:
+  case SQLCOM_SHOW_PACKAGE_BODY_CODE:
     {
 #ifndef DBUG_OFF
+      Database_qualified_name pkgname(&null_clex_str, &null_clex_str);
       sp_head *sp;
       const Sp_handler *sph= Sp_handler::handler(lex->sql_command);
 #ifdef WITH_WSREP
       if (WSREP_CLIENT(thd) && wsrep_sync_wait(thd)) goto error;
 #endif /* WITH_WSREP */
+      if (sph->sp_resolve_package_routine(thd, thd->lex->sphead,
+                                          lex->spname, &pkgname))
+        return true;
       if (sph->sp_cache_routine(thd, lex->spname, false, &sp))
         goto error;
       if (!sp || sp->show_routine_code(thd))
       {
         /* We don't distinguish between errors for now */
         my_error(ER_SP_DOES_NOT_EXIST, MYF(0),
-                 SP_COM_STRING(lex), lex->spname->m_name.str);
+                 sph->type_str(), lex->spname->m_name.str);
         goto error;
       }
       break;
@@ -7910,6 +7933,8 @@ void mysql_parse(THD *thd, char *rawbuf, uint length,
     THD_STAGE_INFO(thd, stage_freeing_items);
     sp_cache_enforce_limit(thd->sp_proc_cache, stored_program_cache_size);
     sp_cache_enforce_limit(thd->sp_func_cache, stored_program_cache_size);
+    sp_cache_enforce_limit(thd->sp_package_spec_cache, stored_program_cache_size);
+    sp_cache_enforce_limit(thd->sp_package_body_cache, stored_program_cache_size);
     thd->end_statement();
     thd->cleanup_after_query();
     DBUG_ASSERT(thd->change_list.is_empty());
@@ -9677,7 +9702,7 @@ LEX_USER *create_definer(THD *thd, LEX_CSTRING *user_name,
     The function is not used in existing code but can be useful later?
 */
 
-bool check_string_byte_length(LEX_CSTRING *str, uint err_msg,
+bool check_string_byte_length(const LEX_CSTRING *str, uint err_msg,
                               uint max_byte_length)
 {
   if (str->length <= max_byte_length)
@@ -9707,7 +9732,7 @@ bool check_string_byte_length(LEX_CSTRING *str, uint err_msg,
 */
 
 
-bool check_string_char_length(LEX_CSTRING *str, uint err_msg,
+bool check_string_char_length(const LEX_CSTRING *str, uint err_msg,
                               uint max_char_length, CHARSET_INFO *cs,
                               bool no_error)
 {
@@ -9726,7 +9751,7 @@ bool check_string_char_length(LEX_CSTRING *str, uint err_msg,
 }
 
 
-bool check_ident_length(LEX_CSTRING *ident)
+bool check_ident_length(const LEX_CSTRING *ident)
 {
   if (check_string_char_length(ident, 0, NAME_CHAR_LEN, system_charset_info, 1))
   {

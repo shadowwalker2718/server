@@ -46,6 +46,17 @@ sp_cache **Sp_handler_function::get_cache(THD *thd) const
   return &thd->sp_func_cache;
 }
 
+sp_cache **Sp_handler_package_spec::get_cache(THD *thd) const
+{
+  return &thd->sp_package_spec_cache;
+}
+
+sp_cache **Sp_handler_package_body::get_cache(THD *thd) const
+{
+  return &thd->sp_package_body_cache;
+}
+
+
 ulong Sp_handler_procedure::recursion_depth(THD *thd) const
 {
   return thd->variables.max_sp_recursion_depth;
@@ -86,6 +97,8 @@ bool Sp_handler_procedure::add_instr_preturn(THD *thd, sp_head *sp,
 
 Sp_handler_procedure sp_handler_procedure;
 Sp_handler_function sp_handler_function;
+Sp_handler_package_spec sp_handler_package_spec;
+Sp_handler_package_body sp_handler_package_body;
 Sp_handler_trigger sp_handler_trigger;
 
 
@@ -669,7 +682,7 @@ Sp_handler::db_find_routine(THD *thd,
 
   table->field[MYSQL_PROC_FIELD_PARAM_LIST]->val_str_nopad(thd->mem_root,
                                                            &params);
-  if (type() == TYPE_ENUM_PROCEDURE)
+  if (type() != TYPE_ENUM_FUNCTION)
     returns= empty_clex_str;
   else if (table->field[MYSQL_PROC_FIELD_RETURNS]->val_str_nopad(thd->mem_root,
                                                                  &returns))
@@ -708,6 +721,23 @@ Sp_handler::db_find_routine(THD *thd,
     close_system_tables(thd, &open_tables_state_backup);
   thd->variables.sql_mode= saved_mode;
   DBUG_RETURN(ret);
+}
+
+
+int
+Sp_handler::db_find_and_cache_routine(THD *thd,
+                                      const Database_qualified_name *name,
+                                      sp_head **sp) const
+{
+  int rc= db_find_routine(thd, name, sp);
+  if (rc == SP_OK)
+  {
+    sp_cache_insert(get_cache(thd), *sp);
+    DBUG_PRINT("info", ("added new: 0x%lx, level: %lu, flags %x",
+                        (ulong) sp[0], sp[0]->m_recursion_level,
+                        sp[0]->m_flags));
+  }
+  return rc;
 }
 
 
@@ -929,6 +959,21 @@ Sp_handler::db_load_routine(THD *thd, const Database_qualified_name *name,
     (*sphp)->set_info(created, modified, chistics, sql_mode);
     (*sphp)->set_creation_ctx(creation_ctx);
     (*sphp)->optimize();
+
+    if (type() == TYPE_ENUM_PACKAGE_BODY)
+    {
+      sp_package *package= sphp[0]->get_package();
+      List_iterator<LEX> it(package->m_routine_implementations);
+      for (LEX *lex; (lex= it++); )
+      {
+        DBUG_ASSERT(lex->sphead);
+        lex->sphead->set_definer(&definer.user, &definer.host);
+        lex->sphead->m_sql_mode= sql_mode;
+        lex->sphead->set_creation_ctx(creation_ctx);
+        lex->sphead->optimize();
+      }
+    }
+
     /*
       Not strictly necessary to invoke this method here, since we know
       that we've parsed CREATE PROCEDURE/FUNCTION and not an
@@ -1020,6 +1065,31 @@ Sp_handler::sp_drop_routine_internal(THD *thd,
 }
 
 
+int
+Sp_handler::sp_find_and_drop_routine(THD *thd, TABLE *table,
+                                     const Database_qualified_name *name) const
+{
+  int ret;
+  if (SP_OK != (ret= db_find_routine_aux(thd, name, table)))
+    return ret;
+  return sp_drop_routine_internal(thd, name, table);
+}
+
+
+int
+Sp_handler_package_spec::
+  sp_find_and_drop_routine(THD *thd, TABLE *table,
+                           const Database_qualified_name *name) const
+{
+  int ret;
+  if (SP_OK != (ret= db_find_routine_aux(thd, name, table)))
+    return ret;
+  // TODO: check return value:
+  (void) sp_handler_package_body.sp_find_and_drop_routine(thd, table, name);
+  return Sp_handler::sp_find_and_drop_routine(thd, table, name);
+}
+
+
 /**
   Write stored-routine object into mysql.proc.
 
@@ -1104,7 +1174,21 @@ Sp_handler::sp_create_routine(THD *thd, const sp_head *sp) const
     {
       if (lex->create_info.or_replace())
       {
-        if ((ret= sp_drop_routine_internal(thd, sp, table)))
+        switch (type()) {
+        case TYPE_ENUM_PACKAGE:
+          ret= sp_handler_package_spec.sp_find_and_drop_routine(thd, table, sp);
+          break;
+        case TYPE_ENUM_PACKAGE_BODY:
+        case TYPE_ENUM_FUNCTION:
+        case TYPE_ENUM_PROCEDURE:
+          ret= sp_drop_routine_internal(thd, sp, table);
+          break;
+        case TYPE_ENUM_TRIGGER:
+        case TYPE_ENUM_PROXY:
+          DBUG_ASSERT(0);
+          ret= SP_OK;
+        }
+        if (ret)
           goto done;
       }
       else if (lex->create_info.if_not_exists())
@@ -1335,6 +1419,69 @@ done:
 }
 
 
+static bool
+append_suid(String *buf, enum_sp_suid_behaviour suid)
+{
+  return suid == SP_IS_NOT_SUID &&
+         buf->append(STRING_WITH_LEN("    SQL SECURITY INVOKER\n"));
+}
+
+
+static bool
+append_comment(String *buf, const LEX_CSTRING &comment)
+{
+  if (!comment.length)
+    return false;
+  if (buf->append(STRING_WITH_LEN("    COMMENT ")))
+    return true;
+  append_unescaped(buf, comment.str, comment.length);
+  return buf->append('\n');
+}
+
+
+static bool
+append_package_chistics(String *buf, const st_sp_chistics &chistics)
+{
+  return append_suid(buf, chistics.suid) ||
+         append_comment(buf, chistics.comment);
+}
+
+
+bool
+Sp_handler_package::show_create_sp(THD *thd, String *buf,
+                                   const LEX_CSTRING &db,
+                                   const LEX_CSTRING &name,
+                                   const LEX_CSTRING &params,
+                                   const LEX_CSTRING &returns,
+                                   const LEX_CSTRING &body,
+                                   const st_sp_chistics &chistics,
+                                   const AUTHID &definer,
+                                   const DDL_options_st ddl_options,
+                                   sql_mode_t sql_mode) const
+{
+  sql_mode_t old_sql_mode= thd->variables.sql_mode;
+  thd->variables.sql_mode= sql_mode;
+  bool rc=
+    buf->append(STRING_WITH_LEN("CREATE ")) ||
+    (ddl_options.or_replace() &&
+     buf->append(STRING_WITH_LEN("OR REPLACE "))) ||
+    append_definer(thd, buf, &definer.user, &definer.host) ||
+    buf->append(type_lex_cstring()) ||
+    buf->append(" ", 1) ||
+    (ddl_options.if_not_exists() &&
+     buf->append(STRING_WITH_LEN("IF NOT EXISTS "))) ||
+    (db.length > 0 &&
+     (append_identifier(thd, buf, db.str, db.length) ||
+      buf->append('.'))) ||
+    append_identifier(thd, buf, name.str, name.length) ||
+    append_package_chistics(buf, chistics) ||
+    buf->append(" ", 1) ||
+    buf->append(body.str, body.length);
+  thd->variables.sql_mode= old_sql_mode;
+  return rc;
+}
+
+
 /**
   Delete the record for the stored routine object from mysql.proc
   and do binary logging.
@@ -1368,10 +1515,7 @@ Sp_handler::sp_drop_routine(THD *thd,
   if (!(table= open_proc_table_for_update(thd)))
     DBUG_RETURN(SP_OPEN_TABLE_FAILED);
 
-  if ((ret= db_find_routine_aux(thd, name, table)) == SP_OK)
-    ret= sp_drop_routine_internal(thd, name, table);
-
-  if (ret == SP_OK &&
+  if (SP_OK == (ret= sp_find_and_drop_routine(thd, table, name)) &&
       write_bin_log(thd, TRUE, thd->query(), thd->query_length()))
     ret= SP_INTERNAL_ERROR;
   /*
@@ -1563,9 +1707,12 @@ bool lock_db_routines(THD *thd, const char *db)
 
       longlong sp_type= table->field[MYSQL_PROC_MYSQL_TYPE]->val_int();
       MDL_request *mdl_request= new (thd->mem_root) MDL_request;
-      mdl_request->init(sp_type == TYPE_ENUM_FUNCTION ?
-                        MDL_key::FUNCTION : MDL_key::PROCEDURE,
-                        db, sp_name, MDL_EXCLUSIVE, MDL_TRANSACTION);
+      const Sp_handler *sph= Sp_handler::handler((stored_procedure_type)
+                                                 sp_type);
+      if (!sph)
+        sph= &sp_handler_procedure;
+      mdl_request->init(sph->get_mdl_type(), db, sp_name,
+                        MDL_EXCLUSIVE, MDL_TRANSACTION);
       mdl_requests.push_front(mdl_request);
     } while (! (nxtres= table->file->ha_index_next_same(table->record[0], keybuf, key_len)));
   }
@@ -1711,6 +1858,117 @@ Sp_handler::sp_show_create_routine(THD *thd,
 }
 
 
+/*
+  A helper class to split package name from a dot-qualified name:
+    'pkg.name' -> 'pkg'
+*/
+class Prefix_name: public LEX_CSTRING
+{
+  char m_buf[SAFE_NAME_LEN + 1];
+public:
+  Prefix_name(const THD *thd, const LEX_CSTRING &name)
+  {
+    const char *end;
+    if (!(thd->variables.sql_mode & MODE_ORACLE) ||
+        !(end= strchr(name.str, '.')))
+    {
+      static_cast<LEX_CSTRING*>(this)[0]= null_clex_str;
+    }
+    else
+    {
+      size_t package_length= end - name.str;
+      LEX_CSTRING::length= my_snprintf(m_buf, sizeof(m_buf), "%.*s",
+                                    (int) package_length, name.str);
+      LEX_CSTRING::str= m_buf;
+    }
+  }
+};
+
+
+/*
+  In case of recursions, we create multiple copies of the same SP.
+  This methods checks the current recursion depth.
+  In case if the recursion limit exceeded, it throws an error
+  and returns NULL.
+  Otherwise, depending on the current recursion level, it:
+  - either returns the original SP,
+  - or makes and returns a new clone of SP
+
+  TODO: it currently does not support recursive package routines.
+  The problem is that in order to compile a package routine outside
+  of CREATE PACKAGE BODY statement, we need to recreate the full
+  package context.
+*/
+sp_head *
+Sp_handler::sp_clone_and_link_routine(THD *thd,
+                                      const Database_qualified_name *name,
+                                      sp_head *sp) const
+{
+  DBUG_ENTER("sp_link_routine");
+  ulong level;
+  sp_head *new_sp;
+  LEX_CSTRING returns= empty_clex_str;
+
+  /*
+    String buffer for RETURNS data type must have system charset;
+    64 -- size of "returns" column of mysql.proc.
+  */
+  String retstr(64);
+  retstr.set_charset(sp->get_creation_ctx()->get_client_cs());
+
+  DBUG_PRINT("info", ("found: 0x%lx", (ulong)sp));
+  if (sp->m_first_free_instance)
+  {
+    DBUG_PRINT("info", ("first free: 0x%lx  level: %lu  flags %x",
+                        (ulong)sp->m_first_free_instance,
+                        sp->m_first_free_instance->m_recursion_level,
+                        sp->m_first_free_instance->m_flags));
+    DBUG_ASSERT(!(sp->m_first_free_instance->m_flags & sp_head::IS_INVOKED));
+    if (sp->m_first_free_instance->m_recursion_level > recursion_depth(thd))
+    {
+      recursion_level_error(thd, sp);
+      DBUG_RETURN(0);
+    }
+    DBUG_RETURN(sp->m_first_free_instance);
+  }
+  /*
+    Actually depth could be +1 than the actual value in case a SP calls
+    SHOW CREATE PROCEDURE. Hence, the linked list could hold up to one more
+    instance.
+  */
+
+  level= sp->m_last_cached_sp->m_recursion_level + 1;
+  if (level > recursion_depth(thd))
+  {
+    recursion_level_error(thd, sp);
+    DBUG_RETURN(0);
+  }
+
+  if (type() == TYPE_ENUM_FUNCTION)
+  {
+    sp_returns_type(thd, retstr, sp);
+    returns= retstr.lex_cstring();
+  }
+  if (db_load_routine(thd, name, &new_sp,
+                      sp->m_sql_mode, sp->m_params, returns,
+                      sp->m_body, sp->chistics(),
+                      sp->m_definer,
+                      sp->m_created, sp->m_modified,
+                      sp->get_creation_ctx()) == SP_OK)
+  {
+    sp->m_last_cached_sp->m_next_cached_sp= new_sp;
+    new_sp->m_recursion_level= level;
+    new_sp->m_first_instance= sp;
+    sp->m_last_cached_sp= sp->m_first_free_instance= new_sp;
+    DBUG_PRINT("info", ("added level: 0x%lx, level: %lu, flags %x",
+                        (ulong)new_sp, new_sp->m_recursion_level,
+                        new_sp->m_flags));
+    DBUG_RETURN(new_sp);
+  }
+  DBUG_RETURN(0);
+}
+
+
 /**
   Obtain object representing stored procedure/function by its name from
   stored procedures cache and looking into mysql.proc if needed.
@@ -1728,92 +1986,63 @@ Sp_handler::sp_show_create_routine(THD *thd,
 */
 
 sp_head *
-Sp_handler::sp_find_routine(THD *thd, const Database_qualified_name *name,
-                            bool cache_only) const
+Sp_handler::sp_find_standalone_routine(THD *thd,
+                                       const Database_qualified_name *name,
+                                       bool cache_only) const
 {
-  sp_cache **cp= get_cache(thd);
-  sp_head *sp;
-  DBUG_ENTER("sp_find_routine");
+  DBUG_ENTER("sp_find_standalone_routine");
   DBUG_PRINT("enter", ("name:  %.*s.%.*s  type: %s  cache only %d",
                        (int) name->m_db.length, name->m_db.str,
                        (int) name->m_name.length, name->m_name.str,
                        type_str(), cache_only));
+  sp_cache **cp= get_cache(thd);
+  sp_head *sp;
 
   if ((sp= sp_cache_lookup(cp, name)))
-  {
-    ulong level;
-    sp_head *new_sp;
-    LEX_CSTRING returns= empty_clex_str;
-
-    /*
-      String buffer for RETURNS data type must have system charset;
-      64 -- size of "returns" column of mysql.proc.
-    */
-    String retstr(64);
-    retstr.set_charset(sp->get_creation_ctx()->get_client_cs());
-
-    DBUG_PRINT("info", ("found: 0x%lx", (ulong)sp));
-    if (sp->m_first_free_instance)
-    {
-      DBUG_PRINT("info", ("first free: 0x%lx  level: %lu  flags %x",
-                          (ulong)sp->m_first_free_instance,
-                          sp->m_first_free_instance->m_recursion_level,
-                          sp->m_first_free_instance->m_flags));
-      DBUG_ASSERT(!(sp->m_first_free_instance->m_flags & sp_head::IS_INVOKED));
-      if (sp->m_first_free_instance->m_recursion_level > recursion_depth(thd))
-      {
-        recursion_level_error(thd, sp);
-        DBUG_RETURN(0);
-      }
-      DBUG_RETURN(sp->m_first_free_instance);
-    }
-    /*
-      Actually depth could be +1 than the actual value in case a SP calls
-      SHOW CREATE PROCEDURE. Hence, the linked list could hold up to one more
-      instance.
-    */
-
-    level= sp->m_last_cached_sp->m_recursion_level + 1;
-    if (level > recursion_depth(thd))
-    {
-      recursion_level_error(thd, sp);
-      DBUG_RETURN(0);
-    }
-
-    if (type() == TYPE_ENUM_FUNCTION)
-    {
-      sp_returns_type(thd, retstr, sp);
-      returns= retstr.lex_cstring();
-    }
-    if (db_load_routine(thd, name, &new_sp,
-                        sp->m_sql_mode, sp->m_params, returns,
-                        sp->m_body, sp->chistics(),
-                        sp->m_definer,
-                        sp->m_created, sp->m_modified,
-                        sp->get_creation_ctx()) == SP_OK)
-    {
-      sp->m_last_cached_sp->m_next_cached_sp= new_sp;
-      new_sp->m_recursion_level= level;
-      new_sp->m_first_instance= sp;
-      sp->m_last_cached_sp= sp->m_first_free_instance= new_sp;
-      DBUG_PRINT("info", ("added level: 0x%lx, level: %lu, flags %x",
-                          (ulong)new_sp, new_sp->m_recursion_level,
-                          new_sp->m_flags));
-      DBUG_RETURN(new_sp);
-    }
-    DBUG_RETURN(0);
-  }
+    DBUG_RETURN(sp_clone_and_link_routine(thd, name, sp));
   if (!cache_only)
-  {
-    if (db_find_routine(thd, name, &sp) == SP_OK)
-    {
-      sp_cache_insert(cp, sp);
-      DBUG_PRINT("info", ("added new: 0x%lx, level: %lu, flags %x",
-                          (ulong)sp, sp->m_recursion_level,
-                          sp->m_flags));
-    }
-  }
+    db_find_and_cache_routine(thd, name, &sp);
   DBUG_RETURN(sp);
+}
+
+
+sp_head *
+Sp_handler::sp_find_package_routine(THD *thd,
+                                    const LEX_CSTRING pkgname_str,
+                                    const Database_qualified_name *name,
+                                    bool cache_only) const
+{
+  DBUG_ENTER("sp_find_package_routine");
+  Database_qualified_name pkgname(&name->m_db, &pkgname_str);
+  sp_head *ph= sp_cache_lookup(&thd->sp_package_body_cache, &pkgname);
+  if (!ph && !cache_only)
+    sp_handler_package_body.db_find_and_cache_routine(thd, &pkgname, &ph);
+  if (ph)
+  {
+    LEX_CSTRING tmp= name->m_name;
+    const char *dot= strchr(tmp.str, '.');
+    size_t prefix_length= dot ? dot - tmp.str + 1 : 0;
+    sp_package *pkg= ph->get_package();
+    tmp.str+= prefix_length;
+    tmp.length-= prefix_length;
+    // TODO: fix FIND() to check handler???
+    LEX *plex= pkg ? pkg->m_routine_implementations.find(tmp, type()) : NULL;
+    sp_head *sp= plex ? plex->sphead : NULL;
+    if (sp)
+      DBUG_RETURN(sp_clone_and_link_routine(thd, name, sp));
+  }
+  DBUG_RETURN(NULL);
+}
+
+
+sp_head *
+Sp_handler::sp_find_routine(THD *thd, const Database_qualified_name *name,
+                            bool cache_only) const
+{
+  Prefix_name pkgname(thd, name->m_name);
+  if (!pkgname.length)
+    return sp_find_standalone_routine(thd, name, cache_only);
+  return sp_find_package_routine(thd, pkgname, name, cache_only);
 }
 
 
@@ -1924,6 +2153,209 @@ bool sp_add_used_routine(Query_tables_list *prelocking_ctx, Query_arena *arena,
 }
 
 
+/*
+  Find and cache a routine in a parser-safe reentrant mode.
+
+  If sp_head is not in the cache,
+  its loaded from mysql.proc, parsed using parse_sql(), and cached.
+  Note, as it is called from inside parse_sql() itself,
+  we need to preserve and restore the parser state.
+
+  It's used during parsing of CREATE PACKAGE BODY,
+  to load the corresponding CREATE PACKAGE.
+*/
+int
+Sp_handler::
+  sp_cache_standalone_routine_reentrant(THD *thd,
+                                        const Database_qualified_name *name,
+                                        sp_head **sp) const
+{
+  int ret;
+  Parser_state *oldps= thd->m_parser_state;
+  thd->m_parser_state= NULL;
+  ret= sp_cache_standalone_routine(thd, name, false, sp);
+  thd->m_parser_state= oldps;
+  return ret;
+}
+
+
+/*
+  Check if a routine has a declaration in the CREATE PACKAGE statement,
+  by looking up in thd->sp_package_spec_cache, and by loading from mysql.proc
+  if needed.
+
+    @param thd      current thd
+    @param db       the database name
+    @param package  the package name
+    @param name     the routine name
+    @param type     the routine type
+    @retval         true, if the routine has a declaration
+    @retval         false, if the routine does not have a declaration
+
+  This function can be called in arbitrary context:
+  - inside a package routine
+  - inside a standalone routine
+  - inside a anonymous block
+  - outside of any routines
+
+  The state of the package specification (i.e. the CREATE PACKAGE statement)
+  for "package" before the call of this function is not known:
+   it can be cached, or not cached.
+  After the call of this function, the package specification is always cached,
+  unless a fatal error happens.
+*/
+static bool
+is_package_public_routine(THD *thd,
+                          const LEX_CSTRING &db,
+                          const LEX_CSTRING &package,
+                          const LEX_CSTRING &routine,
+                          stored_procedure_type type)
+{
+  sp_head *sp= NULL;
+  Database_qualified_name tmp(db, package);
+  bool ret= sp_handler_package_spec.
+              sp_cache_standalone_routine_reentrant(thd, &tmp, &sp);
+  sp_package *spec= (!ret && sp) ? sp->get_package() : NULL;
+  return spec && spec->m_routine_declarations.find(routine, type);
+}
+
+
+/*
+  Check if a routine has a declaration in the CREATE PACKAGE statement
+  by looking up in sp_package_spec_cache.
+
+    @param thd      current thd
+    @param db       the database name
+    @param pkgname  the package name
+    @param name     the routine name
+    @param type     the routine type
+    @retval         true, if the routine has a declaration
+    @retval         false, if the routine does not have a declaration
+
+  This function is called in the middle of CREATE PACKAGE BODY parsing,
+  to lookup the current package routines.
+  The package specification (i.e. the CREATE PACKAGE statement) for
+  the current package body must already be loaded and cached at this point.
+*/
+static bool
+is_package_public_routine_quick(THD *thd,
+                                const LEX_CSTRING &db,
+                                const LEX_CSTRING &pkgname,
+                                const LEX_CSTRING &name,
+                                stored_procedure_type type)
+{
+  Database_qualified_name tmp(db, pkgname);
+  sp_head *sp= sp_cache_lookup(&thd->sp_package_spec_cache, &tmp);
+  sp_package *pkg= sp ? sp->get_package() : NULL;
+  DBUG_ASSERT(pkg); // Must already be cached
+  return pkg && pkg->m_routine_declarations.find(name, type);
+}
+
+
+/**
+  Detect cases when a package routine (rather than a standalone routine)
+  is called, and rewrite sp_name accordingly.
+
+  @param thd              Current thd
+  @param caller           The caller routine (or NULL if outside of a routine)
+  @param [IN/OUT] name    The called routine name
+  @param [OUT]    pkgname If the routine is found to be a package routine,
+                          pkgname is populated with the package name.
+                          Otherwise, it's not touched.
+  @retval         false   on success
+  @retval         true    on error (e.g. EOM, could not read CREATE PACKAGE)
+*/
+bool
+Sp_handler::sp_resolve_package_routine(THD *thd,
+                                       sp_head *caller,
+                                       sp_name *name,
+                                       Database_qualified_name *pkgname) const
+{
+  sp_package *pkg;
+
+  /*
+    TODO: handle cases when there is no current database,
+    and there is a call for a database standalone routine,
+    which calls a package routine internally.
+  */
+  if (!thd->db || !(thd->variables.sql_mode & MODE_ORACLE))
+    return false;
+
+  if (name->m_explicit_name)
+  {
+    /*
+      If a qualified routine name was used, e.g. xxx.yyy(),
+      we possibly have a call to a package routine.
+      Rewrite name if name->m_db (xxx) is a known package,
+      and name->m_name (yyy) is a public routine in this package.
+    */
+    LEX_CSTRING tmpdb= thd->db_lex_cstring();
+    if (!is_package_public_routine(thd, tmpdb, name->m_db, name->m_name, type()))
+      return false;
+    pkgname->m_db= tmpdb;
+    pkgname->m_name= name->m_db;
+    return name->make_package_routine_name(thd, tmpdb,
+                                           name->m_db, name->m_name);
+  }
+
+  if (!caller || !caller->m_name.length)
+  {
+    /*
+      We are either in a an anonymous block,
+      or not in a routine at all.
+    */
+    return false;
+  }
+
+  if (caller->m_parent)
+  {
+    // A package routine calls a non-qualified routine
+    int ret= SP_OK;
+    Prefix_name pkgstr(thd, caller->m_name);
+    DBUG_ASSERT(pkgstr.length);
+    LEX_CSTRING tmpname; // Non-qualified m_name
+    tmpname.str= caller->m_name.str + pkgstr.length + 1;
+    tmpname.length= caller->m_name.length - pkgstr.length - 1;
+
+    /*
+      We're here if a package routine calls another non-qualified
+      function or procedure, e.g. yyy().
+      We need to distinguish two cases:
+      - yyy() is another routine from the same package
+      - yyy() is a standalone routine from the same database
+      To detect if yyy() is a package (rather than a standalone) routine,
+      we check if:
+      - yyy() recursively calls itself
+      - yyy() is earlier implementedin the current CREATE PACKAGE BODY
+      - yyy() is declared in the corresponding CREATE PACKAGE
+    */
+    if ((tmpname.length == name->m_name.length &&
+         !strcmp(tmpname.str, name->m_name.str)) ||
+        caller->m_parent->m_routine_implementations.find(name->m_name, type()) ||
+        is_package_public_routine_quick(thd, caller->m_db,
+                                        pkgstr, name->m_name, type()))
+    {
+      DBUG_ASSERT(ret == SP_OK);
+      pkgname->copy(thd->mem_root, Database_qualified_name(caller->m_db, pkgstr));
+      if (name->make_package_routine_name(thd, pkgstr, name->m_name))
+        return true;
+    }
+    return ret != SP_OK;
+  }
+
+  if ((pkg= caller->get_package()) &&
+       pkg->m_routine_implementations.find(name->m_name, type()))
+  {
+    pkgname->m_db= caller->m_db;
+    pkgname->m_name= caller->m_name;
+    // Package initialization section is calling a non-qualified routine
+    return name->make_package_routine_name(thd, caller->m_name, name->m_name);
+  }
+
+  return false; // A standalone routine is called
+}
+
+
 /**
   Add routine which is explicitly used by statement to the set of stored
   routines used by this statement.
@@ -1941,7 +2373,7 @@ bool sp_add_used_routine(Query_tables_list *prelocking_ctx, Query_arena *arena,
     (and will take into account that this is an explicitly used routine).
 */
 
-void Sp_handler::add_used_routine(Query_tables_list *prelocking_ctx,
+bool Sp_handler::add_used_routine(Query_tables_list *prelocking_ctx,
                                   Query_arena *arena,
                                   const Database_qualified_name *rt) const
 {
@@ -1950,6 +2382,7 @@ void Sp_handler::add_used_routine(Query_tables_list *prelocking_ctx,
   prelocking_ctx->sroutines_list_own_last= prelocking_ctx->sroutines_list.next;
   prelocking_ctx->sroutines_list_own_elements=
                     prelocking_ctx->sroutines_list.elements;
+  return false;
 }
 
 
@@ -2113,15 +2546,15 @@ int Sroutine_hash_entry::sp_cache_routine(THD *thd,
   @retval non-0  Error while loading routine from mysql,proc table.
 */
 
-int Sp_handler::sp_cache_routine(THD *thd,
-                                 const Database_qualified_name *name,
-                                 bool lookup_only,
-                                 sp_head **sp) const
+int Sp_handler::sp_cache_standalone_routine(THD *thd,
+                                            const Database_qualified_name *name,
+                                            bool lookup_only,
+                                            sp_head **sp) const
 {
   int ret= 0;
   sp_cache **spc= get_cache(thd);
 
-  DBUG_ENTER("sp_cache_routine");
+  DBUG_ENTER("sp_cache_standalone_routine");
 
   DBUG_ASSERT(spc);
 
@@ -2137,10 +2570,9 @@ int Sp_handler::sp_cache_routine(THD *thd,
       DBUG_RETURN(SP_OK);
   }
 
-  switch ((ret= db_find_routine(thd, name, sp)))
+  switch ((ret= db_find_and_cache_routine(thd, name, sp)))
   {
     case SP_OK:
-      sp_cache_insert(spc, *sp);
       break;
     case SP_KEY_NOT_FOUND:
       ret= SP_OK;
@@ -2168,6 +2600,51 @@ int Sp_handler::sp_cache_routine(THD *thd,
       }
       break;
   }
+  DBUG_RETURN(ret);
+}
+
+
+int
+Sp_handler::sp_cache_package_routine(THD *thd,
+                                     const LEX_CSTRING &pkgname_cstr,
+                                     const Database_qualified_name *name,
+                                     bool lookup_only, sp_head **sp) const
+{
+  DBUG_ENTER("sp_cache_package_routine");
+  DBUG_ASSERT(type() == TYPE_ENUM_FUNCTION || type() == TYPE_ENUM_PROCEDURE);
+  sp_name pkgname(&name->m_db, &pkgname_cstr, false);
+  sp_head *ph= NULL;
+  int ret= sp_handler_package_body.sp_cache_standalone_routine(thd, &pkgname,
+                                                               lookup_only,
+                                                               &ph);
+  if (!ret)
+  {
+    sp_package *pkg= ph ? ph->get_package() : NULL;
+    LEX_CSTRING tmp= name->m_name;
+    const char *dot= strchr(tmp.str, '.');
+    size_t prefix_length= dot ? dot - tmp.str + 1 : NULL;
+    tmp.str+= prefix_length;
+    tmp.length-= prefix_length;
+    LEX *rlex= pkg ? pkg->m_routine_implementations.find(tmp, type()) : NULL;
+    *sp= rlex ? rlex->sphead : NULL;
+  }
+
+  DBUG_RETURN(ret);
+}
+
+
+int Sp_handler::
+sp_cache_routine(THD *thd,
+                 const Database_qualified_name *name,
+                 bool lookup_only, sp_head **sp) const
+{
+  DBUG_ENTER("sp_cache_routine");
+  Prefix_name pkgname_cstr(thd, name->m_name);
+  int ret;
+  if (!pkgname_cstr.length)
+    ret= sp_cache_standalone_routine(thd, name, lookup_only, sp);
+  else
+    ret= sp_cache_package_routine(thd, pkgname_cstr, name, lookup_only, sp);
   DBUG_RETURN(ret);
 }
 
@@ -2243,14 +2720,8 @@ Sp_handler::show_create_sp(THD *thd, String *buf,
   }
   if (chistics.detistic)
     buf->append(STRING_WITH_LEN("    DETERMINISTIC\n"));
-  if (chistics.suid == SP_IS_NOT_SUID)
-    buf->append(STRING_WITH_LEN("    SQL SECURITY INVOKER\n"));
-  if (chistics.comment.length)
-  {
-    buf->append(STRING_WITH_LEN("    COMMENT "));
-    append_unescaped(buf, chistics.comment.str, chistics.comment.length);
-    buf->append('\n');
-  }
+  append_suid(buf, chistics.suid);
+  append_comment(buf, chistics.comment);
   buf->append(body);
   thd->variables.sql_mode= old_sql_mode;
   return false;

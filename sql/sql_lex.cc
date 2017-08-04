@@ -2909,9 +2909,31 @@ void LEX::cleanup_lex_after_parse_error(THD *thd)
   */
   if (thd->lex->sphead)
   {
+    sp_package *pkg;
     thd->lex->sphead->restore_thd_mem_root(thd);
-    delete thd->lex->sphead;
-    thd->lex->sphead= NULL;
+    if ((pkg= thd->lex->sphead->m_parent))
+    {
+      /*
+        If a syntax error happened inside a package routine definition,
+        then thd->lex points to the routine sublex. We need to restore to
+        the top level LEX.
+        No needs to delete thd->lex->sphead here, as it's referenced from
+        either pkg->m_routine_declarations or pkg->m_routine_implementations
+        and will be deleted during "delete pkg".
+      */
+      DBUG_ASSERT(pkg->get_package());
+      DBUG_ASSERT(pkg->m_top_level_lex);
+      pkg->restore_thd_mem_root(thd);
+      LEX *top= pkg->m_top_level_lex;
+      delete pkg;
+      thd->lex= top;
+      thd->lex->sphead= NULL;
+    }
+    else
+    {
+      delete thd->lex->sphead;
+      thd->lex->sphead= NULL;
+    }
   }
 }
 
@@ -5119,13 +5141,43 @@ void LEX::set_stmt_init()
 };
 
 
+/**
+  Find a local or a package variable by name.
+  @param IN  name - the variable name
+  @param OUT ctx  - NULL, if the variable was not found,
+                    or LEX::spcont (if a local variable was found)
+                    or the package top level context
+                    (if a package variable was found)
+  @retval         - the variable (if found), or NULL otherwise.
+*/
+sp_variable *
+LEX::find_variable(const LEX_CSTRING *name, sp_pcontext **ctx) const
+{
+  sp_variable *spv;
+  if (spcont && (spv= spcont->find_variable(name, false)))
+  {
+    *ctx= spcont;
+    return spv;
+  }
+  sp_package *pkg= sphead ? sphead->m_parent : NULL;
+  if (pkg && (spv= pkg->find_package_variable(name)))
+  {
+    *ctx= pkg->get_parse_context();
+    return spv;
+  }
+  *ctx= NULL;
+  return NULL;
+}
+
+
 bool LEX::init_internal_variable(struct sys_var_with_base *variable,
                                  const LEX_CSTRING *name)
 {
   sp_variable *spv;
+  sp_pcontext *ctx;
 
   /* Best effort lookup for system variable. */
-  if (!spcont || !(spv = spcont->find_variable(name, false)))
+  if (!spcont || !(spv= find_variable(name, &ctx)))
   {
     struct sys_var_with_base tmp= {NULL, *name};
 
@@ -5798,7 +5850,7 @@ bool LEX::sp_block_finalize(THD *thd, const Lex_spblock_st spblock,
 }
 
 
-sp_name *LEX::make_sp_name(THD *thd, LEX_CSTRING *name)
+sp_name *LEX::make_sp_name(THD *thd, const LEX_CSTRING *name)
 {
   sp_name *res;
   LEX_CSTRING db;
@@ -5810,37 +5862,62 @@ sp_name *LEX::make_sp_name(THD *thd, LEX_CSTRING *name)
 }
 
 
-sp_name *LEX::make_sp_name(THD *thd, LEX_CSTRING *name1, LEX_CSTRING *name2)
+sp_name *LEX::make_sp_name(THD *thd, const LEX_CSTRING *name1,
+                                     const LEX_CSTRING *name2)
 {
   sp_name *res;
-  if (!name1->str || check_db_name((LEX_STRING*) name1))
+  LEX_CSTRING norm_name1;
+  if (!name1->str ||
+      !thd->make_lex_string(&norm_name1, name1->str, name1->length) ||
+      check_db_name((LEX_STRING *) &norm_name1))
   {
     my_error(ER_WRONG_DB_NAME, MYF(0), name1->str);
     return NULL;
   }
   if (check_routine_name(name2) ||
-      (!(res= new (thd->mem_root) sp_name(name1, name2, true))))
+      (!(res= new (thd->mem_root) sp_name(&norm_name1, name2, true))))
     return NULL;
   return res;
 }
 
 
-sp_head *LEX::make_sp_head(THD *thd, const sp_name *name,
+sp_head *LEX::make_sp_head(THD *thd, sp_package *package,
+                           const sp_name *name,
                            const Sp_handler *sph)
 {
   sp_head *sp;
 
   /* Order is important here: new - reset - init */
-  if ((sp= new sp_head(sph)))
+  if ((sp= new sp_head(package, sph)))
   {
     sp->reset_thd_mem_root(thd);
     sp->init(this);
     if (name)
+    {
       sp->init_sp_name(thd, name);
+      if (package)
+      {
+        sp->make_package_routine_name(thd, sphead->m_name, sp->m_name);
+        sp->make_qname(thd, &sp->m_qname);
+      }
+    }
     sphead= sp;
   }
   sp_chistics.init();
   return sp;
+}
+
+
+sp_head *LEX::make_sp_head_no_recursive(THD *thd, sp_package *package,
+                                        const sp_name *name,
+                                        const Sp_handler *sph)
+{
+  if (!sphead ||
+      sphead->m_handler->type() == TYPE_ENUM_PACKAGE_BODY ||
+      sphead->m_handler->type() == TYPE_ENUM_PACKAGE)
+    return make_sp_head(thd, package, name, sph);
+  my_error(ER_SP_NO_RECURSIVE_CREATE, MYF(0), sph->type_str());
+  return NULL;
 }
 
 
@@ -5905,6 +5982,14 @@ LEX::sp_block_with_exceptions_finalize_exceptions(THD *thd,
     to the executable section.
   */
   return sphead->add_instr_jump(thd, spcont, executable_section_ip);
+}
+
+
+bool LEX::sp_block_with_exceptions_add_empty(THD *thd)
+{
+  uint ip= sphead->instructions();
+  return sp_block_with_exceptions_finalize_executable_section(thd, ip) ||
+         sp_block_with_exceptions_finalize_exceptions(thd, ip, 0);
 }
 
 
@@ -6127,7 +6212,7 @@ bool LEX::maybe_start_compound_statement(THD *thd)
 {
   if (!sphead)
   {
-    if (!make_sp_head(thd, NULL, &sp_handler_procedure))
+    if (!make_sp_head(thd, NULL, NULL, &sp_handler_procedure))
       return true;
     sphead->set_suid(SP_IS_NOT_SUID);
     sphead->set_body_start(thd, thd->m_parser_state->m_lip.get_cpp_ptr());
@@ -6570,6 +6655,18 @@ Item *LEX::create_item_limit(THD *thd,
 }
 
 
+bool LEX::set_user_variable(THD *thd, const LEX_CSTRING *name, Item *val)
+{
+  Item_func_set_user_var *item;
+  set_var_user *var;
+  if (!(item= new (thd->mem_root) Item_func_set_user_var(thd, name,  val)) ||
+      !(var= new (thd->mem_root) set_var_user(item)))
+    return true;
+  var_list.push_back(var, thd->mem_root);
+  return false;
+}
+
+
 /*
   Perform assignment for a trigger, a system variable, or an SP variable.
   "variable" be previously set by init_internal_variable(variable, name).
@@ -6592,10 +6689,15 @@ bool LEX::set_variable(struct sys_var_with_base *variable, Item *item)
     was previously checked by init_internal_variable().
   */
   DBUG_ASSERT(spcont);
-  sp_variable *spv= spcont->find_variable(&variable->base_name, false);
+  sp_pcontext *ctx;
+  sp_variable *spv= find_variable(&variable->base_name, &ctx);
   DBUG_ASSERT(spv);
-  /* It is a local variable. */
-  return sphead->set_local_variable(thd, spcont, spv, item, this, true);
+  DBUG_ASSERT(ctx);
+  if (ctx == spcont) /* It is a local variable. */
+    return sphead->set_local_variable(thd, spcont, spv, item, this, true);
+  DBUG_ASSERT(sphead && sphead->m_parent && sphead->m_parent->get_package() &&
+              ctx == sphead->m_parent->get_parse_context());
+  return set_user_variable(thd, &variable->base_name, item);
 }
 
 
@@ -6653,6 +6755,18 @@ Item *LEX::create_item_ident_sp(THD *thd, LEX_CSTRING *name,
     if (!my_strcasecmp(system_charset_info, name->str, "SQLERRM"))
       return new (thd->mem_root) Item_func_sqlerrm(thd);
   }
+
+  if (sphead->m_parent &&
+      (spv= sphead->m_parent->find_package_variable(name)))
+  {
+    if (!parsing_options.allows_variable)
+    {
+      my_error(ER_VIEW_SELECT_VARIABLE, MYF(0));
+      return NULL;
+    }
+    return new (thd->mem_root) Item_func_get_user_var(thd, name);
+  }
+
   return create_item_ident_nosp(thd, name);
 }
 
@@ -7100,4 +7214,138 @@ bool LEX::add_create_view(THD *thd, DDL_options_st ddl,
                                       algorithm, suid)))
     return true;
   return create_or_alter_view_finalize(thd, table_ident);
+}
+
+
+sp_package *LEX::get_sp_package() const
+{
+  return sphead ? sphead->get_package() : NULL;
+}
+
+
+sp_package *LEX::create_package_start(THD *thd,
+                                      enum_sql_command command,
+                                      const Sp_handler *sph,
+                                      const sp_name *name_arg,
+                                      DDL_options_st options)
+{
+  if (set_command_with_check(command, options))
+    return NULL;
+  sp_package *pkg;
+  if (sph->type() == TYPE_ENUM_PACKAGE_BODY)
+  {
+    /*
+      If we start parsing a "CREATE PACKAGE BODY", we need to load
+      the corresponding "CREATE PACKAGE", for the following reasons:
+      1. "CREATE PACKAGE BODY" is allowed only if "CREATE PACKAGE"
+         was done earlier for the same package name.
+         So if "CREATE PACKAGE" does not exist, we throw an error here.
+      2. When parsing "CREATE PACKAGE BODY", we need to know all package
+         public and private routine names, to translate procedure and
+         function calls correctly.
+         For example, this statement inside a package routine:
+           CALL p;
+         can be translated to:
+           CALL db.pkg.p; -- p is a known (public or private) package routine
+           CALL db.p;     -- p is not a known package routine
+    */
+    sp_head *spec;
+    int ret= sp_handler_package_spec.
+               sp_cache_standalone_routine_reentrant(thd, name_arg, &spec);
+    if (!spec)
+    {
+      if (!ret)
+        my_error(ER_SP_DOES_NOT_EXIST, MYF(0),
+                 "PACKAGE", ErrConvDQName(name_arg).ptr());
+      return 0;
+    }
+  }
+  if (!(pkg= new sp_package(this, name_arg, sph)))
+    return NULL;
+  pkg->reset_thd_mem_root(thd);
+  pkg->init(this);
+  pkg->make_qname(thd, &pkg->m_qname);
+  sphead= pkg;
+  return pkg;
+}
+
+
+bool LEX::create_package_finalize(THD *thd,
+                                  const sp_name *name,
+                                  const sp_name *name2,
+                                  const char *body_start,
+                                  const char *body_end)
+{
+  if (name2 &&
+      (name2->m_explicit_name != name->m_explicit_name ||
+       strcmp(name2->m_db.str, name->m_db.str) ||
+       strcmp(name2->m_name.str, name->m_name.str)))
+  {
+    bool exp= name2->m_explicit_name || name->m_explicit_name;
+    my_error(ER_END_IDENTIFIER_DOES_NOT_MATCH, MYF(0),
+             exp ? ErrConvDQName(name2).ptr() : name2->m_name.str,
+             exp ? ErrConvDQName(name).ptr() : name->m_name.str);
+    return true;
+  }
+  sphead->m_body.length= body_end - body_start;
+  if (!(sphead->m_body.str= thd->strmake(body_start, sphead->m_body.length)))
+    return true;
+
+  uint not_used;
+  Lex_input_stream *lip= & thd->m_parser_state->m_lip;
+  sphead->m_defstr.length= lip->get_cpp_ptr() - lip->get_cpp_buf();
+  sphead->m_defstr.str= thd->strmake(lip->get_cpp_buf(), sphead->m_defstr.length);
+  trim_whitespace(thd->charset(), &sphead->m_defstr, &not_used);
+
+  sphead->restore_thd_mem_root(thd);
+  sp_package *pkg= sphead->get_package();
+  DBUG_ASSERT(pkg);
+  return pkg->validate_after_parser(thd);
+}
+
+
+bool LEX::call_statement_start(THD *thd, sp_name *name)
+{
+  Database_qualified_name pkgname(&null_clex_str, &null_clex_str);
+  sql_command= SQLCOM_CALL;
+  spname= name;
+  value_list.empty();
+  if (sp_handler_procedure.sp_resolve_package_routine(thd, thd->lex->sphead,
+                                                      name, &pkgname))
+    return true;
+  if (sp_handler_procedure.add_used_routine(this, thd, name))
+    return true;
+  if (pkgname.m_name.length &&
+      sp_handler_package_body.add_used_routine(this, thd, &pkgname))
+    return true;
+  return false;
+}
+
+
+bool LEX::call_statement_start(THD *thd, const LEX_CSTRING *name)
+{
+  sp_name *spname= make_sp_name(thd, name);
+  return !spname || call_statement_start(thd, spname);
+}
+
+
+bool LEX::call_statement_start(THD *thd, const LEX_CSTRING *name1,
+                                         const LEX_CSTRING *name2)
+{
+  sp_name *spname= make_sp_name(thd, name1, name2);
+  return !spname || call_statement_start(thd, spname);
+}
+
+
+bool LEX::add_grant_command(THD *thd, enum_sql_command sql_command_arg,
+                            stored_procedure_type type_arg)
+{
+  if (columns.elements)
+  {
+    thd->parse_error();
+    return true;
+  }
+  sql_command= sql_command_arg,
+  type= type_arg;
+  return false;
 }
