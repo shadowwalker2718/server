@@ -21,3 +21,5 @@ innodb-wl5522-debug-zip  : broken upstream
 innodb_bug12902967       : broken upstream
 file_contents            : MDEV-6526 these files are not installed anymore
 max_statement_time       : cannot possibly work, depends on timing
+delete_use_source        : Waiting for fix from Sergei
+errors                   : Waiting for merge of 10.1 -> 10.2 -> 10.3
